@@ -100,114 +100,102 @@ def av_get(function, ticker, api_key, **kwargs):
         raise RuntimeError(f"Ticker '{ticker}' not found. Check the symbol.")
     return data
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_all(ticker, api_key):
     import time
-    results = []
-    calls = [
-        ("OVERVIEW",          {}),
-        ("INCOME_STATEMENT",  {}),
-        ("BALANCE_SHEET",     {}),
-        ("CASH_FLOW",         {}),
-        ("GLOBAL_QUOTE",      {}),
-        ("TIME_SERIES_DAILY", {"outputsize": "compact"}),
-    ]
-    for i, (function, kwargs) in enumerate(calls):
-        if i > 0:
-            time.sleep(1.2)   # stay under 1 req/sec free tier limit
-        results.append(av_get(function, ticker, api_key, **kwargs))
-    return tuple(results)
+    # Only 2 calls — OVERVIEW has price, balance sheet ratios, dividends, margins, EPS, market cap
+    # INCOME_STATEMENT gives us net income and revenue for EPV calculation
+    overview = av_get("OVERVIEW",         ticker, api_key)
+    time.sleep(1.2)
+    income   = av_get("INCOME_STATEMENT", ticker, api_key)
+    return overview, income
 
 
 # ── Extract financials from AV responses ──────────────────────────────────────
 
 def latest(report_list):
-    """Return the most recent annual report dict from AV annualReports list."""
     try:
         return report_list[0] if report_list else {}
     except Exception:
         return {}
 
-def extract_financials(overview, income, balance, cashflow, quote, daily):
+def extract_financials(overview, income):
     d = {}
-
-    q  = quote.get("Global Quote", {})
     inc = latest(income.get("annualReports", []))
-    bal = latest(balance.get("annualReports", []))
-    cf  = latest(cashflow.get("annualReports", []))
 
     # ── Price & market ──
-    d["price"]       = safe_float(q.get("05. price"))
-    d["shares"]      = safe_float(overview.get("SharesOutstanding"))
-    d["market_cap"]  = safe_float(overview.get("MarketCapitalization"))
-    d["beta"]        = safe_float(overview.get("Beta"))
-    d["sector"]      = overview.get("Sector", "N/A")
-    d["industry"]    = overview.get("Industry", "N/A")
-    d["name"]        = overview.get("Name", overview.get("Symbol", ""))
+    d["price"]      = safe_float(overview.get("50DayMovingAverage"))   # fallback
+    d["price"]      = safe_float(overview.get("AnalystTargetPrice")) and \
+                      safe_float(overview.get("50DayMovingAverage"))
+    # Best price proxy from OVERVIEW (no live quote endpoint used)
+    for field in ["50DayMovingAverage", "52WeekHigh", "52WeekLow"]:
+        pass  # we'll use calculated from market cap / shares below
+    d["market_cap"] = safe_float(overview.get("MarketCapitalization"))
+    d["shares"]     = safe_float(overview.get("SharesOutstanding"))
+    # Derive price from market cap / shares as best estimate
+    d["price"]      = safe_div(d["market_cap"], d["shares"]) \
+                      if d["market_cap"] and d["shares"] else None
+    # Override with 50-day MA as a reasonable current price proxy
+    d["price"]      = safe_float(overview.get("50DayMovingAverage")) or d["price"]
+    d["beta"]       = safe_float(overview.get("Beta"))
+    d["sector"]     = overview.get("Sector", "N/A")
+    d["industry"]   = overview.get("Industry", "N/A")
+    d["name"]       = overview.get("Name", overview.get("Symbol", ""))
 
     # ── P&L ──
-    d["revenue"]     = safe_float(inc.get("totalRevenue"))
-    d["net_income"]  = safe_float(inc.get("netIncome"))
-    d["ebitda"]      = safe_float(overview.get("EBITDA"))
-    d["eps"]         = safe_float(overview.get("EPS"))
+    d["revenue"]          = safe_float(inc.get("totalRevenue"))
+    d["net_income"]       = safe_float(inc.get("netIncome"))
+    d["ebitda"]           = safe_float(overview.get("EBITDA"))
+    d["eps"]              = safe_float(overview.get("EPS"))
 
-    # ── Balance sheet ──
-    d["total_debt"]  = safe_float(bal.get("shortLongTermDebtTotal")) or \
-                       (safe_float(bal.get("longTermDebt"), 0) or 0) + \
-                       (safe_float(bal.get("shortTermDebt"), 0) or 0)
-    d["cash"]        = safe_float(bal.get("cashAndCashEquivalentsAtCarryingValue")) or \
-                       safe_float(bal.get("cashAndShortTermInvestments"), 0)
-    d["total_equity"]= safe_float(bal.get("totalShareholderEquity"))
-    d["book_value"]  = safe_div(d["total_equity"], d["shares"]) if d["total_equity"] and d["shares"] else \
-                       safe_float(overview.get("BookValue"))
+    # ── Balance sheet (from OVERVIEW ratios) ──
+    d["book_value"]       = safe_float(overview.get("BookValue"))       # per share
+    d["total_equity"]     = (d["book_value"] or 0) * (d["shares"] or 0) \
+                            if d["book_value"] and d["shares"] else None
+    # Debt and cash: derive from EV and market cap
+    # EV = MarketCap + Debt - Cash  →  Debt - Cash = EV - MarketCap
+    ev_raw                = safe_float(overview.get("EVToEBITDA"))
+    ev_dollars            = (ev_raw or 0) * (d["ebitda"] or 0) if ev_raw and d["ebitda"] else None
+    d["ev_dollars"]       = ev_dollars
+    net_debt              = (ev_dollars or 0) - (d["market_cap"] or 0) if ev_dollars and d["market_cap"] else 0
+    d["total_debt"]       = max(net_debt, 0)
+    d["cash"]             = max(-net_debt, 0)
 
-    # ── Cash flow ──
-    d["capex"]       = abs(safe_float(cf.get("capitalExpenditures"), 0) or 0)
-    d["operating_cf"]= safe_float(cf.get("operatingCashflow"), 0)
-    d["dividends_paid"] = abs(safe_float(cf.get("dividendPayout"), 0) or 0)
+    # ── Cash flow proxies ──
+    d["capex"]            = abs(safe_float(inc.get("capitalExpenditures"), 0) or 0)
+    d["operating_cf"]     = safe_float(overview.get("OperatingCashflowTTM"), 0) or 0
+    d["dividends_paid"]   = 0  # not available without CASH_FLOW call
 
-    # Dividend per share approximation
-    d["dividend_ttm"] = safe_div(d["dividends_paid"], d["shares"]) if d["shares"] else \
-                        safe_float(overview.get("DividendPerShare"), 0)
+    # Dividends per share
+    d["dividend_ttm"]     = safe_float(overview.get("DividendPerShare"), 0) or 0
+    d["dividend_yield"]   = safe_float(overview.get("DividendYield"), 0) or 0
 
-    # ── Multiples from overview ──
-    d["pe_ratio"]    = safe_float(overview.get("PERatio"))
-    d["pb_ratio"]    = safe_float(overview.get("PriceToBookRatio"))
-    d["ps_ratio"]    = safe_float(overview.get("PriceToSalesRatioTTM"))
-    d["ev"]          = safe_float(overview.get("EVToEBITDA"))   # ratio; we'll compute $ EV below
-    d["ev_dollars"]  = (d["market_cap"] or 0) + (d["total_debt"] or 0) - (d["cash"] or 0) \
-                       if d["market_cap"] else None
-    d["dividend_yield"]  = safe_float(overview.get("DividendYield"), 0)
+    # ── Multiples ──
+    d["pe_ratio"]         = safe_float(overview.get("PERatio"))
+    d["pb_ratio"]         = safe_float(overview.get("PriceToBookRatio"))
+    d["ps_ratio"]         = safe_float(overview.get("PriceToSalesRatioTTM"))
 
     # ── Growth ──
-    d["revenue_growth"]  = safe_float(overview.get("QuarterlyRevenueGrowthYOY"))
-    d["earnings_growth"] = safe_float(overview.get("QuarterlyEarningsGrowthYOY"))
+    d["revenue_growth"]   = safe_float(overview.get("QuarterlyRevenueGrowthYOY"))
+    d["earnings_growth"]  = safe_float(overview.get("QuarterlyEarningsGrowthYOY"))
 
     # ── Profitability ──
-    d["roe"]             = safe_float(overview.get("ReturnOnEquityTTM"))
-    d["roa"]             = safe_float(overview.get("ReturnOnAssetsTTM"))
-    d["gross_margin"]    = safe_float(overview.get("GrossProfitTTM")) and \
-                           safe_div(safe_float(overview.get("GrossProfitTTM")), d["revenue"])
-    d["gross_margin"]    = safe_div(safe_float(inc.get("grossProfit")), d["revenue"])
-    d["operating_margin"]= safe_float(overview.get("OperatingMarginTTM"))
-    d["net_margin"]      = safe_float(overview.get("ProfitMargin"))
+    d["roe"]              = safe_float(overview.get("ReturnOnEquityTTM"))
+    d["roa"]              = safe_float(overview.get("ReturnOnAssetsTTM"))
+    d["gross_margin"]     = safe_div(safe_float(inc.get("grossProfit")), d["revenue"])
+    d["operating_margin"] = safe_float(overview.get("OperatingMarginTTM"))
+    d["net_margin"]       = safe_float(overview.get("ProfitMargin"))
 
     # ROIC approximation
     try:
-        nopat = (d["net_income"] or 0) + (d["total_debt"] or 0) * 0.04
+        nopat    = (d["net_income"] or 0) + (d["total_debt"] or 0) * 0.04
         invested = (d["total_equity"] or 0) + (d["total_debt"] or 0) - (d["cash"] or 0)
         d["roic"] = safe_div(nopat, invested)
     except Exception:
         d["roic"] = None
 
-    # ── 1Y price history ──
-    ts = daily.get("Time Series (Daily)", {})
-    if ts:
-        dates  = sorted(ts.keys())[-252:]
-        prices = [safe_float(ts[d2]["4. close"]) for d2 in dates]
-        d["price_history"] = pd.Series(prices, index=pd.to_datetime(dates), name="Price ($)")
-    else:
-        d["price_history"] = None
+    # No price history (saves 1 API call)
+    d["price_history"] = None
 
     return d
 
@@ -397,7 +385,7 @@ with st.sidebar:
     ) * 1e6
 
     st.divider()
-    st.caption("Free tier: 25 requests/day · 5/min")
+    st.caption("Free tier: 25 req/day · 2 calls per ticker = 12 tickers/day")
     run = st.button("🔍 Analyse", use_container_width=True, type="primary")
 
 
@@ -423,9 +411,9 @@ if run:
     st.cache_data.clear()
 
 # ── Fetch ──
-with st.spinner(f"Fetching data for **{ticker}** from Alpha Vantage (pacing requests, ~8 sec)…"):
+with st.spinner(f"Fetching data for **{ticker}** from Alpha Vantage (2 requests)…"):
     try:
-        overview, income, balance, cashflow, quote, daily = fetch_all(ticker, api_key)
+        overview, income = fetch_all(ticker, api_key)
     except RuntimeError as e:
         st.error(str(e))
         st.stop()
@@ -437,7 +425,7 @@ if not overview or not overview.get("Symbol"):
     st.error(f"No data returned for **{ticker}**. Check the ticker and your API key.")
     st.stop()
 
-d = extract_financials(overview, income, balance, cashflow, quote, daily)
+d = extract_financials(overview, income)
 v = compute_valuations(d, r, g, lifo_reserve)
 
 # ── Company header ────────────────────────────────────────────────────────────
