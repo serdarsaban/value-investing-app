@@ -186,13 +186,32 @@ def extract_financials(overview, income):
     d["operating_margin"] = safe_float(overview.get("OperatingMarginTTM"))
     d["net_margin"]       = safe_float(overview.get("ProfitMargin"))
 
-    # ROIC approximation
+    # ── ROIC — book formula: Operating Earnings (EBIT) ÷ Operating Assets ──
+    # Operating Earnings = EBIT = Revenue − COGS − OpEx  (pre-interest, pre-tax)
+    #   Best proxy from available data: net_income / (1 - tax_rate) + interest_expense
+    #   Simplified: use operating_margin × revenue as EBIT proxy
+    # Operating Assets = Total Assets − Surplus Cash − Non-operating investments
+    #   Proxy: Total Equity + Total Debt − Surplus Cash  (= Invested Capital)
+    #   We use book equity + net debt as operating assets
     try:
-        nopat    = (d["net_income"] or 0) + (d["total_debt"] or 0) * 0.04
-        invested = (d["total_equity"] or 0) + (d["total_debt"] or 0) - (d["cash"] or 0)
-        d["roic"] = safe_div(nopat, invested)
+        # EBIT proxy: operating margin × revenue
+        ebit = (d["operating_margin"] or 0) * (d["revenue"] or 0) \
+               if d["operating_margin"] and d["revenue"] else None
+
+        # Fallback: derive EBIT from net income using effective tax rate proxy (21%)
+        if not ebit and d["net_income"]:
+            ebit = d["net_income"] / (1 - 0.21)
+
+        # Operating Assets = Equity + Debt - Surplus Cash
+        # Surplus cash = cash beyond what's needed to run the business
+        # Conservative: treat all cash as surplus (gives lower, more conservative ROIC)
+        operating_assets = (d["total_equity"] or 0) + (d["total_debt"] or 0) - (d["cash"] or 0)
+
+        d["ebit"]  = ebit
+        d["roic"]  = safe_div(ebit, operating_assets) if operating_assets and operating_assets > 0 else None
     except Exception:
-        d["roic"] = None
+        d["ebit"]  = None
+        d["roic"]  = None
 
     # No price history (saves 1 API call)
     d["price_history"] = None
@@ -589,10 +608,21 @@ with tab3:
     st.caption("F = (ROC − G) ÷ (R − G).  If ROC = R, growth adds zero value.")
 
     g1, g2, g3, g4 = st.columns(4)
-    g1.metric("ROIC (approx.)",  fmt_pct(d["roic"]))
+    g1.metric("ROIC",            fmt_pct(d["roic"]) if d["roic"] else "N/A",
+              help="EBIT ÷ Operating Assets (book formula)")
     g2.metric("ROE",             fmt_pct(d["roe"]))
     g3.metric("Growth Factor F", fmt_x(v["growth_factor_F"]))
     g4.metric("Growth Mult. M",  fmt_x(v["growth_mult_M"]))
+
+    # Show ROIC inputs
+    op_assets = (d["total_equity"] or 0) + (d["total_debt"] or 0) - (d["cash"] or 0)
+    ri1, ri2, ri3 = st.columns(3)
+    ri1.metric("EBIT (op. earnings)", fmt_currency(d.get("ebit")),
+               help="Operating margin × Revenue  (pre-interest, pre-tax)")
+    ri2.metric("Operating Assets",    fmt_currency(op_assets),
+               help="Equity + Debt − Surplus Cash")
+    ri3.metric("ROIC check",          fmt_pct(safe_div(d.get("ebit"), op_assets))
+               if d.get("ebit") and op_assets else "N/A")
 
     roc_used = d["roic"] or d["roe"]
     if roc_used and v["growth_factor_F"]:
