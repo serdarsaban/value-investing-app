@@ -634,7 +634,7 @@ with tab4:
 
     fv1, fv2, fv3 = st.columns(3)
     fv1.metric("EPV (Total)",        fmt_currency(v["epv_total"]))
-    fv2.metric("Reproduction Cost",  fmt_currency(v["reproduction_cost"]),
+    fv2.metric("Asset Value (Repro. Cost)", fmt_currency(v["asset_value_total"]),
                help="Total equity book value + LIFO reserve")
     fv3.metric("Franchise Value",    fmt_currency(v["franchise_value"]))
 
@@ -643,7 +643,7 @@ with tab4:
         if v["franchise_value"] > 0:
             st.success(f"✅ Positive franchise value ({fmt_pct(fv_pct)} of EPV) — competitive moat likely.")
         else:
-            st.warning("⚠️ EPV ≤ Reproduction Cost — limited evidence of a durable moat.")
+            st.warning("⚠️ EPV ≤ Asset Value — limited evidence of a durable moat.")
 
     st.markdown('<div class="section-header">Cap Rate — Ch.10 (Mario Gabelli)</div>', unsafe_allow_html=True)
     st.caption("Cap Rate = (EBITDA − Capex) ÷ Enterprise Value")
