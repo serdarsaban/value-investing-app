@@ -102,13 +102,21 @@ def av_get(function, ticker, api_key, **kwargs):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_all(ticker, api_key):
-    overview   = av_get("OVERVIEW",             ticker, api_key)
-    income     = av_get("INCOME_STATEMENT",     ticker, api_key)
-    balance    = av_get("BALANCE_SHEET",        ticker, api_key)
-    cashflow   = av_get("CASH_FLOW",            ticker, api_key)
-    quote      = av_get("GLOBAL_QUOTE",         ticker, api_key)
-    daily      = av_get("TIME_SERIES_DAILY",    ticker, api_key, outputsize="compact")
-    return overview, income, balance, cashflow, quote, daily
+    import time
+    results = []
+    calls = [
+        ("OVERVIEW",          {}),
+        ("INCOME_STATEMENT",  {}),
+        ("BALANCE_SHEET",     {}),
+        ("CASH_FLOW",         {}),
+        ("GLOBAL_QUOTE",      {}),
+        ("TIME_SERIES_DAILY", {"outputsize": "compact"}),
+    ]
+    for i, (function, kwargs) in enumerate(calls):
+        if i > 0:
+            time.sleep(1.2)   # stay under 1 req/sec free tier limit
+        results.append(av_get(function, ticker, api_key, **kwargs))
+    return tuple(results)
 
 
 # ── Extract financials from AV responses ──────────────────────────────────────
@@ -353,7 +361,7 @@ if run:
     st.cache_data.clear()
 
 # ── Fetch ──
-with st.spinner(f"Fetching data for **{ticker}** from Alpha Vantage…"):
+with st.spinner(f"Fetching data for **{ticker}** from Alpha Vantage (pacing requests, ~8 sec)…"):
     try:
         overview, income, balance, cashflow, quote, daily = fetch_all(ticker, api_key)
     except RuntimeError as e:
