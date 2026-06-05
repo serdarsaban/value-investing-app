@@ -218,41 +218,54 @@ def compute_valuations(d, r, g, lifo_reserve=0.0):
     v = {}
     rg = r - g
 
-    v["market_cap"]  = d["market_cap"] or \
-                       ((d["price"] or 0) * (d["shares"] or 0) if d["price"] and d["shares"] else None)
-    v["ev"]          = d["ev_dollars"] or \
-                       ((v["market_cap"] or 0) + (d["total_debt"] or 0) - (d["cash"] or 0))
+    # ── Market ──
+    v["market_cap"] = d["market_cap"] or \
+                      ((d["price"] or 0) * (d["shares"] or 0) if d["price"] and d["shares"] else None)
+    v["ev"]         = d["ev_dollars"] or \
+                      ((v["market_cap"] or 0) + (d["total_debt"] or 0) - (d["cash"] or 0))
 
-    # EPV
-    adj_earn         = d["net_income"] or ((d["eps"] or 0) * (d["shares"] or 1))
-    v["epv_total"]   = safe_div(adj_earn, r)
-    v["epv_per_share"]= safe_div(v["epv_total"], d["shares"])
+    # ════════════════════════════════════════════════════════════
+    # ELEMENT 1 — Asset Value (Reproduction Cost)
+    # Most reliable: tangible current assets adjusted to today's cost
+    # ════════════════════════════════════════════════════════════
+    book_total = (d["book_value"] or 0) * (d["shares"] or 0) \
+                 if d["book_value"] and d["shares"] else (d["total_equity"] or 0)
+    # Add LIFO reserve (inventory adjustment to current cost)
+    v["asset_value_total"]    = book_total + lifo_reserve
+    v["asset_value_per_share"]= safe_div(v["asset_value_total"], d["shares"])
 
-    # Reproduction cost
-    book_total       = (d["book_value"] or 0) * (d["shares"] or 0) \
-                       if d["book_value"] and d["shares"] else (d["total_equity"] or 0)
-    v["reproduction_cost"] = book_total + lifo_reserve
+    # ════════════════════════════════════════════════════════════
+    # ELEMENT 2 — Earnings Power Value (EPV)
+    # Intermediate: value as earnings machine, zero growth assumed
+    # EPV = Adjusted Earnings / R
+    # Adjusted earnings: net income, backed out by maintenance capex proxy
+    # ════════════════════════════════════════════════════════════
+    net_inc = d["net_income"] or ((d["eps"] or 0) * (d["shares"] or 1))
+    # Maintenance capex approximation: use reported capex (conservative)
+    # Distributable cash flow = net income (AV does not provide D&A separately)
+    adj_earnings       = net_inc
+    v["adj_earnings"]  = adj_earnings
+    v["epv_total"]     = safe_div(adj_earnings, r)
+    v["epv_per_share"] = safe_div(v["epv_total"], d["shares"])
 
-    # Franchise value
-    v["franchise_value"]    = (v["epv_total"] or 0) - v["reproduction_cost"] if v["epv_total"] else None
-    v["franchise_per_share"]= safe_div(v["franchise_value"], d["shares"])
+    # Franchise Value = EPV − Asset Value (confirms moat exists)
+    v["franchise_value"]     = (v["epv_total"] or 0) - v["asset_value_total"] \
+                               if v["epv_total"] else None
+    v["franchise_per_share"] = safe_div(v["franchise_value"], d["shares"])
+    v["has_franchise"]       = (v["franchise_value"] or 0) > 0
 
-    # Margin of Safety
-    v["mos_per_share"] = ((v["epv_per_share"] or 0) - (d["price"] or 0)) \
-                         if v["epv_per_share"] and d["price"] else None
-    v["mos_total"]     = (v["epv_total"] or 0) - (v["market_cap"] or 0) if v["epv_total"] else None
-    v["mos_pct"]       = safe_div(v["mos_total"], v["epv_total"])
-
-    # DDM
-    if rg > 0 and d.get("dividend_ttm") and d["dividend_ttm"] > 0:
-        v["ddm_per_share"] = d["dividend_ttm"] / rg
-        v["ddm_total"]     = v["ddm_per_share"] * (d["shares"] or 0)
-    else:
-        v["ddm_per_share"] = None
-        v["ddm_total"]     = None
-
-    # Growth Factor F
+    # ════════════════════════════════════════════════════════════
+    # ELEMENT 3 — Value of Growth
+    # Lowest reliability: only valid when franchise confirmed (EPV > Asset Value)
+    # PV = Capital × (ROC − G) / (R − G)
+    # ════════════════════════════════════════════════════════════
     roc = d["roic"] or d["roe"] or 0
+    v["roc_used"] = roc
+
+    # Growth only creates value when ROC > R
+    v["growth_adds_value"] = roc > r if roc else None
+
+    # Growth Factor F = (ROC − G) / (R − G)
     v["growth_factor_F"] = safe_div(roc - g, rg) if rg > 0 and roc else None
 
     # Growth Multiplier M
@@ -262,24 +275,73 @@ def compute_valuations(d, r, g, lifo_reserve=0.0):
     else:
         v["growth_mult_M"] = None
 
-    # Cap Rate
+    # Full PV with growth = EPV × M  (only meaningful if franchise exists AND ROC > R)
+    if v["epv_total"] and v["growth_mult_M"] and v["has_franchise"] and v["growth_adds_value"]:
+        v["pv_with_growth"]          = v["epv_total"] * v["growth_mult_M"]
+        v["pv_with_growth_per_share"]= safe_div(v["pv_with_growth"], d["shares"])
+    else:
+        v["pv_with_growth"]          = None
+        v["pv_with_growth_per_share"]= None
+
+    # ════════════════════════════════════════════════════════════
+    # COMBINED INTRINSIC VALUE
+    # Logic from the book:
+    #   - No franchise (EPV ≤ Assets): use Asset Value
+    #   - Franchise but ROC ≤ R: use EPV (growth neutral/destructive)
+    #   - Franchise and ROC > R: use PV with growth
+    # ════════════════════════════════════════════════════════════
+    if not v["epv_total"]:
+        v["intrinsic_value"]          = v["asset_value_total"]
+        v["intrinsic_value_per_share"]= v["asset_value_per_share"]
+        v["iv_basis"]                 = "Asset Value (no earnings data)"
+    elif not v["has_franchise"]:
+        v["intrinsic_value"]          = v["asset_value_total"]
+        v["intrinsic_value_per_share"]= v["asset_value_per_share"]
+        v["iv_basis"]                 = "Asset Value (EPV ≤ Assets — no moat)"
+    elif not v["growth_adds_value"]:
+        v["intrinsic_value"]          = v["epv_total"]
+        v["intrinsic_value_per_share"]= v["epv_per_share"]
+        v["iv_basis"]                 = "EPV (franchise exists but ROC ≤ R — growth neutral)"
+    else:
+        v["intrinsic_value"]          = v["pv_with_growth"]
+        v["intrinsic_value_per_share"]= v["pv_with_growth_per_share"]
+        v["iv_basis"]                 = "PV with Growth (franchise + ROC > R confirmed)"
+
+    # ════════════════════════════════════════════════════════════
+    # MARGIN OF SAFETY — against combined intrinsic value
+    # ════════════════════════════════════════════════════════════
+    iv = v["intrinsic_value"]
+    iv_ps = v["intrinsic_value_per_share"]
+    v["mos_per_share"] = (iv_ps - (d["price"] or 0)) if iv_ps and d["price"] else None
+    v["mos_total"]     = (iv - (v["market_cap"] or 0)) if iv else None
+    v["mos_pct"]       = safe_div(v["mos_total"], iv)
+
+    # ── DDM ──
+    if rg > 0 and d.get("dividend_ttm") and d["dividend_ttm"] > 0:
+        v["ddm_per_share"] = d["dividend_ttm"] / rg
+        v["ddm_total"]     = v["ddm_per_share"] * (d["shares"] or 0)
+    else:
+        v["ddm_per_share"] = None
+        v["ddm_total"]     = None
+
+    # ── Cap Rate (Gabelli) ──
     op_cf = (d["ebitda"] or 0) - (d["capex"] or 0)
-    v["cap_rate"]              = safe_div(op_cf, v["ev"]) if v["ev"] else None
-    v["operating_cf_for_cap"]  = op_cf
+    v["cap_rate"]             = safe_div(op_cf, v["ev"]) if v["ev"] else None
+    v["operating_cf_for_cap"] = op_cf
 
-    # PEG
+    # ── PEG ──
     g_pct = (d["earnings_growth"] or d["revenue_growth"] or g) * 100
-    v["peg"]  = safe_div(d["pe_ratio"], g_pct) if d["pe_ratio"] and g_pct else None
+    v["peg"] = safe_div(d["pe_ratio"], g_pct) if d["pe_ratio"] and g_pct else None
 
-    # Sonkin adjusted P/E
-    net_cash     = (d["cash"] or 0) - (d["total_debt"] or 0)
-    int_on_cash  = net_cash * 0.04 if net_cash > 0 else 0
-    op_mktcap    = (v["market_cap"] or 0) - net_cash
-    op_earn      = (d["net_income"] or 0) - int_on_cash
+    # ── Sonkin adjusted P/E ──
+    net_cash    = (d["cash"] or 0) - (d["total_debt"] or 0)
+    int_on_cash = net_cash * 0.04 if net_cash > 0 else 0
+    op_mktcap   = (v["market_cap"] or 0) - net_cash
+    op_earn     = (d["net_income"] or 0) - int_on_cash
     v["sonkin_pe"] = safe_div(op_mktcap, op_earn) if op_earn and op_mktcap > 0 else None
     v["net_cash"]  = net_cash
 
-    # 1Y total return
+    # ── 1Y total return ──
     v["total_return"] = None
     if d["price_history"] is not None and len(d["price_history"]) > 1:
         p0 = d["price_history"].iloc[0]
@@ -425,25 +487,98 @@ with tab1:
 
 # ══ TAB 2 ═════════════════════════════════════════════════════════════════════
 with tab2:
-    st.markdown('<div class="section-header">Earnings Power Value (EPV) — Greenwald</div>', unsafe_allow_html=True)
-    st.caption("EPV = Adjusted Earnings ÷ R  (zero-growth, most conservative)")
 
-    e1, e2, e3 = st.columns(3)
-    e1.metric("EPV (Total)",     fmt_currency(v["epv_total"]))
-    e2.metric("EPV per Share",   f"${v['epv_per_share']:,.2f}" if v["epv_per_share"] else "N/A")
-    e3.metric("Current Price",   f"${d['price']:,.2f}" if d["price"] else "N/A")
+    # ── Combined Intrinsic Value banner ──
+    st.markdown('<div class="section-header">Combined Intrinsic Value — Greenwald Three-Element Framework</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="section-header">Margin of Safety</div>', unsafe_allow_html=True)
-    m1, m2, m3 = st.columns(3)
-    m1.metric("MoS per Share",  f"${v['mos_per_share']:,.2f}" if v["mos_per_share"] else "N/A",
-              delta=fmt_pct(v["mos_pct"]) if v["mos_pct"] else None)
-    m2.metric("MoS Total",      fmt_currency(v["mos_total"]))
-    m3.metric("MoS %",          fmt_pct(v["mos_pct"]))
+    iv_ps = v["intrinsic_value_per_share"]
+    price  = d["price"]
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Intrinsic Value / Share", f"${iv_ps:,.2f}" if iv_ps else "N/A")
+    b2.metric("Current Price",           f"${price:,.2f}" if price else "N/A")
+    b3.metric("Margin of Safety",        fmt_pct(v["mos_pct"]) if v["mos_pct"] else "N/A")
+    b4.metric("IV Basis",                v.get("iv_basis", "N/A")[:30] + "…"
+                                         if len(v.get("iv_basis","")) > 30 else v.get("iv_basis","N/A"))
+
     st.markdown("**Signal:** " + mos_signal(v["mos_pct"]), unsafe_allow_html=True)
+    st.caption(f"IV basis: {v.get('iv_basis','N/A')}")
     st.info("Graham: ≥33% margin of safety for adequate protection; ≥50% for strong buy.")
 
+    st.divider()
+
+    # ── Element 1: Asset Value ──
+    st.markdown('<div class="section-header">Element 1 — Asset Value (Reproduction Cost) · Highest Reliability</div>', unsafe_allow_html=True)
+    st.caption("What would it cost a competitor to build this business from scratch? Based on book value + adjustments.")
+
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Book Equity (Total)",     fmt_currency((d["book_value"] or 0) * (d["shares"] or 0)
+                                         if d["book_value"] and d["shares"] else d["total_equity"]))
+    a2.metric("LIFO Reserve Added",      fmt_currency(lifo_reserve))
+    a3.metric("Asset Value (Total)",     fmt_currency(v["asset_value_total"]))
+
+    a4, a5 = st.columns(2)
+    a4.metric("Asset Value / Share",     f"${v['asset_value_per_share']:,.2f}"
+                                         if v["asset_value_per_share"] else "N/A")
+    a5.metric("Price vs Asset Value",
+              f"{safe_div(price, v['asset_value_per_share']):.1f}×"
+              if price and v["asset_value_per_share"] else "N/A",
+              help="Price / Asset Value per share. <1.0 = trading below reproduction cost.")
+
+    st.divider()
+
+    # ── Element 2: EPV ──
+    st.markdown('<div class="section-header">Element 2 — Earnings Power Value (EPV) · Intermediate Reliability</div>', unsafe_allow_html=True)
+    st.caption("Value as an earnings machine assuming zero future growth. EPV = Adjusted Earnings ÷ R")
+
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Adjusted Earnings (TTM)", fmt_currency(v["adj_earnings"]))
+    e2.metric("EPV (Total)",             fmt_currency(v["epv_total"]))
+    e3.metric("EPV / Share",             f"${v['epv_per_share']:,.2f}" if v["epv_per_share"] else "N/A")
+
+    # Franchise value
+    fv = v["franchise_value"]
+    fv_ps = v["franchise_per_share"]
+    fv_pct = safe_div(fv, v["epv_total"]) if v["epv_total"] else None
+
+    e4, e5, e6 = st.columns(3)
+    e4.metric("Asset Value (Total)",     fmt_currency(v["asset_value_total"]))
+    e5.metric("Franchise Value",         fmt_currency(fv),
+              help="EPV − Asset Value. Positive = moat exists.")
+    e6.metric("Franchise / Share",       f"${fv_ps:,.2f}" if fv_ps else "N/A")
+
+    if fv is not None:
+        if fv > 0:
+            st.success(f"✅ EPV (${v['epv_per_share']:,.0f}) > Asset Value (${v['asset_value_per_share']:,.0f}) — franchise confirmed. Moat = {fmt_pct(fv_pct)} of EPV.")
+        else:
+            st.warning("⚠️ EPV ≤ Asset Value — no franchise value detected. Use Asset Value as intrinsic value.")
+
+    st.divider()
+
+    # ── Element 3: Growth Value ──
+    st.markdown('<div class="section-header">Element 3 — Value of Growth · Lowest Reliability</div>', unsafe_allow_html=True)
+    st.caption("Only added when franchise is confirmed AND ROC > R. PV = Capital × (ROC − G) ÷ (R − G)")
+
+    roc = v["roc_used"]
+    g3a, g3b, g3c, g3d = st.columns(4)
+    g3a.metric("ROC (ROIC/ROE)",   fmt_pct(roc) if roc else "N/A")
+    g3b.metric("Cost of Capital R", fmt_pct(r))
+    g3c.metric("Growth Factor F",  fmt_x(v["growth_factor_F"]))
+    g3d.metric("PV with Growth / Share",
+               f"${v['pv_with_growth_per_share']:,.2f}" if v["pv_with_growth_per_share"] else "N/A")
+
+    if not v["has_franchise"]:
+        st.error("🔴 No franchise confirmed — growth value not added to intrinsic value.")
+    elif not v["growth_adds_value"]:
+        st.warning(f"⚠️ ROC ({fmt_pct(roc)}) ≤ R ({fmt_pct(r)}) — growth is value-neutral or destructive. EPV used as intrinsic value.")
+    else:
+        st.success(f"✅ Franchise confirmed + ROC ({fmt_pct(roc)}) > R ({fmt_pct(r)}) — growth adds value. Full PV = ${v['pv_with_growth_per_share']:,.2f}/share.")
+
+    st.divider()
+
+    # ── DDM ──
     st.markdown('<div class="section-header">Dividend Discount Model (DDM) — Ch.6</div>', unsafe_allow_html=True)
-    st.caption("V = Dividend ÷ (R − G)")
+    st.caption("V = Dividend ÷ (R − G) — applicable only to dividend-paying stocks.")
     if d.get("dividend_ttm") and d["dividend_ttm"] > 0:
         d1, d2, d3 = st.columns(3)
         d1.metric("Dividend / Share (TTM)", f"${d['dividend_ttm']:,.4f}")
@@ -533,28 +668,34 @@ with tab5:
     st.caption(f"R = {fmt_pct(r)}  |  G = {fmt_pct(g)}  |  {pd.Timestamp.now().strftime('%d %b %Y')}")
 
     summary_rows = [
-        ("Market",    "Price",               f"${d['price']:,.2f}" if d["price"] else "N/A",   "—"),
-        ("Market",    "Market Cap",           fmt_currency(v["market_cap"]),                    "—"),
-        ("Market",    "Enterprise Value",     fmt_currency(v["ev"]),                            "—"),
-        ("Market",    "1Y Total Return",      fmt_pct(v["total_return"]) if v["total_return"] else "N/A", "—"),
-        ("Valuation", "EPV / Share",          f"${v['epv_per_share']:,.2f}" if v["epv_per_share"] else "N/A", "—"),
-        ("Valuation", "Margin of Safety",     fmt_pct(v["mos_pct"]) if v["mos_pct"] else "N/A",
-                                              "✅ BUY" if (v["mos_pct"] or 0) >= 0.33
-                                              else ("⚠️ HOLD" if (v["mos_pct"] or 0) >= 0.10 else "🔴 SELL")),
-        ("Valuation", "DDM / Share",          f"${v['ddm_per_share']:,.2f}" if v["ddm_per_share"] else "N/A", "—"),
-        ("Valuation", "P/E Ratio",            fmt_x(d["pe_ratio"]) if d["pe_ratio"] else "N/A", "—"),
-        ("Growth",    "ROIC",                 fmt_pct(d["roic"]) if d["roic"] else "N/A",      "—"),
-        ("Growth",    "Growth Factor F",      fmt_x(v["growth_factor_F"]) if v["growth_factor_F"] else "N/A",
-                                              "✅ Value" if (v["growth_factor_F"] or 0) > 1 else "⚠️ Neutral"),
-        ("Growth",    "PEG Ratio",            fmt_x(v["peg"]) if v["peg"] else "N/A",
-                                              "✅ <1" if v["peg"] and v["peg"] < 1
-                                              else ("⚠️ 1–3" if v["peg"] and v["peg"] < 3 else "🔴 >3")),
-        ("Asset",     "Franchise Value",      fmt_currency(v["franchise_value"]),
-                                              "✅ Moat" if (v["franchise_value"] or 0) > 0 else "⚠️ None"),
-        ("Asset",     "Cap Rate",             fmt_pct(v["cap_rate"]) if v["cap_rate"] else "N/A",
-                                              "✅ >8%" if (v["cap_rate"] or 0) >= 0.08
-                                              else ("⚠️ 5–8%" if (v["cap_rate"] or 0) >= 0.05 else "🔴 <5%")),
-        ("Asset",     "Sonkin Adj. P/E",      fmt_x(v["sonkin_pe"]) if v["sonkin_pe"] else "N/A", "—"),
+        ("Market",     "Price",                  f"${d['price']:,.2f}" if d["price"] else "N/A",   "—"),
+        ("Market",     "Market Cap",              fmt_currency(v["market_cap"]),                    "—"),
+        ("Market",     "Enterprise Value",        fmt_currency(v["ev"]),                            "—"),
+        ("Market",     "1Y Total Return",         fmt_pct(v["total_return"]) if v["total_return"] else "N/A", "—"),
+        ("Intrinsic",  "Asset Value / Share",     f"${v['asset_value_per_share']:,.2f}" if v["asset_value_per_share"] else "N/A", "—"),
+        ("Intrinsic",  "EPV / Share",             f"${v['epv_per_share']:,.2f}" if v["epv_per_share"] else "N/A", "—"),
+        ("Intrinsic",  "Franchise Value",         fmt_currency(v["franchise_value"]),
+                                                  "✅ Moat" if v["has_franchise"] else "⚠️ No moat"),
+        ("Intrinsic",  "PV with Growth / Share",  f"${v['pv_with_growth_per_share']:,.2f}" if v["pv_with_growth_per_share"] else "N/A",
+                                                  "✅ Valid" if v["pv_with_growth_per_share"] else "⚠️ Not used"),
+        ("Intrinsic",  "IV Basis",                v.get("iv_basis","N/A")[:40], "—"),
+        ("Valuation",  "Margin of Safety",        fmt_pct(v["mos_pct"]) if v["mos_pct"] else "N/A",
+                                                  "✅ BUY" if (v["mos_pct"] or 0) >= 0.33
+                                                  else ("⚠️ HOLD" if (v["mos_pct"] or 0) >= 0.10 else "🔴 SELL")),
+        ("Valuation",  "DDM / Share",             f"${v['ddm_per_share']:,.2f}" if v["ddm_per_share"] else "N/A", "—"),
+        ("Valuation",  "P/E Ratio",               fmt_x(d["pe_ratio"]) if d["pe_ratio"] else "N/A", "—"),
+        ("Growth",     "ROIC",                    fmt_pct(d["roic"]) if d["roic"] else "N/A",      "—"),
+        ("Growth",     "Growth adds value?",      "Yes" if v["growth_adds_value"] else "No",
+                                                  "✅ Yes" if v["growth_adds_value"] else "🔴 No"),
+        ("Growth",     "Growth Factor F",         fmt_x(v["growth_factor_F"]) if v["growth_factor_F"] else "N/A",
+                                                  "✅ F>1" if (v["growth_factor_F"] or 0) > 1 else "⚠️ F≤1"),
+        ("Growth",     "PEG Ratio",               fmt_x(v["peg"]) if v["peg"] else "N/A",
+                                                  "✅ <1" if v["peg"] and v["peg"] < 1
+                                                  else ("⚠️ 1–3" if v["peg"] and v["peg"] < 3 else "🔴 >3")),
+        ("Asset",      "Cap Rate",                fmt_pct(v["cap_rate"]) if v["cap_rate"] else "N/A",
+                                                  "✅ >8%" if (v["cap_rate"] or 0) >= 0.08
+                                                  else ("⚠️ 5–8%" if (v["cap_rate"] or 0) >= 0.05 else "🔴 <5%")),
+        ("Asset",      "Sonkin Adj. P/E",         fmt_x(v["sonkin_pe"]) if v["sonkin_pe"] else "N/A", "—"),
     ]
 
     df_summary = pd.DataFrame(summary_rows, columns=["Category", "Metric", "Value", "Signal"])
