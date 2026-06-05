@@ -245,7 +245,8 @@ def compute_valuations(d, r, g, lifo_reserve=0.0):
     # ════════════════════════════════════════════════════════════
     # ELEMENT 3 — Value of Growth
     # Lowest reliability: only valid when franchise confirmed (EPV > Asset Value)
-    # PV = Capital × (ROC − G) / (R − G)
+    # Correct formula from the book: PV = Capital × (ROC − G) / (R − G)
+    #                                   = Asset Value × F
     # ════════════════════════════════════════════════════════════
     roc = d["roic"] or d["roe"] or 0
     v["roc_used"] = roc
@@ -254,18 +255,23 @@ def compute_valuations(d, r, g, lifo_reserve=0.0):
     v["growth_adds_value"] = roc > r if roc else None
 
     # Growth Factor F = (ROC − G) / (R − G)
+    # This is the multiplier on capital: PV = Capital × F
     v["growth_factor_F"] = safe_div(roc - g, rg) if rg > 0 and roc else None
 
-    # Growth Multiplier M
+    # Growth Multiplier M = PV / EPV  (informational ratio only — NOT used for PV calculation)
+    # M = (1 - G/R) / (1 - (G/R)(R/ROC))
     if r > 0 and roc and roc > 0:
         gr = g / r
-        v["growth_mult_M"] = safe_div(1 - gr, 1 - gr * (r / roc))
+        denom = 1 - gr * (r / roc)
+        v["growth_mult_M"] = safe_div(1 - gr, denom) if abs(denom) > 1e-9 else None
     else:
         v["growth_mult_M"] = None
 
-    # Full PV with growth = EPV × M  (only meaningful if franchise exists AND ROC > R)
-    if v["epv_total"] and v["growth_mult_M"] and v["has_franchise"] and v["growth_adds_value"]:
-        v["pv_with_growth"]          = v["epv_total"] * v["growth_mult_M"]
+    # PV with Growth = Capital × F  (book formula: Ch.7)
+    # Capital = Asset Value (reproduction cost of assets)
+    # This correctly produces PV > EPV when ROC > R
+    if v["asset_value_total"] and v["growth_factor_F"] and v["has_franchise"] and v["growth_adds_value"]:
+        v["pv_with_growth"]          = v["asset_value_total"] * v["growth_factor_F"]
         v["pv_with_growth_per_share"]= safe_div(v["pv_with_growth"], d["shares"])
     else:
         v["pv_with_growth"]          = None
