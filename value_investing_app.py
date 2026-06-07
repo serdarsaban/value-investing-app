@@ -147,34 +147,64 @@ def get_price_yf(ticker: str) -> float | None:
         return None
 
 
+def _best_per_fy(entries: list) -> dict:
+    """
+    Deduplicate XBRL entries by fiscal year: keep the single best entry per FY.
+    'Best' = latest filed date (most recent amendment/restatement wins).
+    Returns dict of {fy: entry}.
+
+    This prevents the common EDGAR artifact where the same concept appears
+    multiple times for the same FY (e.g. original 10-K + 10-K/A amendment),
+    which can cause incorrect values when sorted naively by end date.
+    """
+    by_fy: dict = {}
+    for e in entries:
+        fy = e.get("fy")
+        if fy is None:
+            continue
+        existing = by_fy.get(fy)
+        if existing is None or e.get("filed", "") > existing.get("filed", ""):
+            by_fy[fy] = e
+    return by_fy
+
+
 def pick_annual(entries: list, prefer_fy: int = None) -> dict | None:
     """
-    From a list of XBRL fact entries, pick the most recent 10-K annual value.
-    Filters to form=10-K, fp=FY, then sorts by end date descending.
-    If prefer_fy given, tries that fiscal year first.
+    Pick the best 10-K annual value from a list of XBRL entries.
+
+    Strategy (fixes the ADSK fiscal-year mismatch bug):
+    1. Filter to 10-K / 10-K/A forms with fp=FY only
+    2. Deduplicate by fiscal year — one entry per FY, latest filing wins
+    3. If prefer_fy given, return that year; otherwise return the most recent FY
+
+    Why deduplicate? EDGAR can have multiple entries for the same concept and
+    the same FY (original + amendments). Sorting by end date alone can pick
+    a restated or partial-year entry over the authoritative annual figure.
     """
     annual = [e for e in entries
               if e.get("form") in ("10-K", "10-K/A")
               and e.get("fp") == "FY"]
     if not annual:
         return None
-    annual.sort(key=lambda x: x.get("end", ""), reverse=True)
-    if prefer_fy:
-        fy_match = [e for e in annual if e.get("fy") == prefer_fy]
-        if fy_match:
-            return fy_match[0]
-    return annual[0]
+    by_fy = _best_per_fy(annual)
+    if not by_fy:
+        return None
+    if prefer_fy and prefer_fy in by_fy:
+        return by_fy[prefer_fy]
+    # Return most recent fiscal year
+    return by_fy[max(by_fy.keys())]
+
 
 def pick_prior_annual(entries: list, latest_fy: int) -> dict | None:
-    """Pick the 10-K entry for the fiscal year before latest_fy."""
+    """Pick the 10-K entry for the fiscal year immediately before latest_fy."""
     annual = [e for e in entries
               if e.get("form") in ("10-K", "10-K/A")
-              and e.get("fp") == "FY"
-              and e.get("fy") == latest_fy - 1]
+              and e.get("fp") == "FY"]
     if not annual:
         return None
-    annual.sort(key=lambda x: x.get("end", ""), reverse=True)
-    return annual[0]
+    by_fy = _best_per_fy(annual)
+    prior_fy = latest_fy - 1
+    return by_fy.get(prior_fy)
 
 def get_concept(facts_usgaap: dict, *concept_names) -> tuple[list, str]:
     """
