@@ -113,11 +113,10 @@ def book_note(text):
 
 # ── FMP fetch layer ───────────────────────────────────────────────────────────
 
-BASE_V3     = "https://financialmodelingprep.com/api/v3"
-BASE_STABLE = "https://financialmodelingprep.com/stable"
+BASE = "https://financialmodelingprep.com/stable"
 
 @st.cache_data(ttl=28800, show_spinner=False)   # 8-hour cache per (endpoint, ticker)
-def fmp_get(endpoint, ticker, api_key, base=None, **params):
+def fmp_get(endpoint, ticker, api_key, **params):
     """
     Single FMP call. Cached 8 hours per (endpoint, ticker).
     Re-running the same ticker costs zero calls within the cache window.
@@ -129,9 +128,8 @@ def fmp_get(endpoint, ticker, api_key, base=None, **params):
       stable/ — newer endpoints (used for a minority of calls)
     All financial statement endpoints live under api/v3.
     """
-    b = base or BASE_V3
-    url = f"{b}/{endpoint}/{ticker}"
-    p = {"apikey": api_key}
+    url = f"{BASE}/{endpoint}"
+    p = {"symbol": ticker, "apikey": api_key}
     p.update(params)
     r = requests.get(url, params=p, timeout=15)
     r.raise_for_status()
@@ -168,19 +166,19 @@ def fetch_data(ticker, api_key, mode):
         time.sleep(0.25)
 
     # Lean — always fetch (2 calls)
-    get("profile",            "profile")
-    get("income-statement",   "income",  limit=2)   # 2 years for YOY growth
+    # stable/profile?symbol=AAPL  and  stable/income-statement?symbol=AAPL
+    get("profile",           "profile")
+    get("income-statement",  "income",  limit=2, period="annual")  # 2 years for YOY
 
     # Full — adds balance sheet + cash flow (2 more calls)
     if mode in ("Full (4 calls)", "Chart (6 calls)"):
-        get("balance-sheet-statement", "balance",  limit=1)
-        get("cash-flow-statement",     "cashflow", limit=1)
+        get("balance-sheet-statement", "balance",  limit=1, period="annual")
+        get("cash-flow-statement",     "cashflow", limit=1, period="annual")
 
     # Chart — adds pre-calc metrics + price history (2 more calls)
     if mode == "Chart (6 calls)":
         get("key-metrics-ttm",         "metrics")
-        # historical-price-full returns {"symbol":…,"historical":[…]}
-        # historical-price-full: ticker goes in the path under api/v3
+        # historical daily prices: stable/historical-price-full?symbol=&timeseries=252
         raw["history"] = fmp_get(
             "historical-price-full", ticker, api_key,
             serietype="line", timeseries=252
@@ -240,7 +238,7 @@ def extract_financials(raw):
     d["price"]      = safe_float(prof.get("price"))
     d["shares"]     = safe_float(prof.get("volAvg"))   # volAvg not shares — fix below
     # FMP profile gives mktCap and price; derive shares
-    d["market_cap"] = safe_float(prof.get("mktCap"))
+    d["market_cap"] = safe_float(prof.get("marketCap") or prof.get("mktCap"))
     d["shares"]     = safe_div(d["market_cap"], d["price"]) if d["market_cap"] and d["price"] else None
     d["beta"]       = safe_float(prof.get("beta"))
     d["price_is_approx"] = False   # FMP profile always has live EOD price
@@ -309,7 +307,7 @@ def extract_financials(raw):
         d["capex_estimated"] = False
 
     # Dividend per share (profile has lastDiv = annual dividend)
-    d["dividend_ttm"] = safe_float(prof.get("lastDiv"), 0)
+    d["dividend_ttm"] = safe_float(prof.get("lastDiv") or prof.get("lastDividend"), 0)
 
     # ── Multiples — prefer key-metrics-ttm when available (Chart mode) ──
     d["pe_ratio"]      = safe_float(met.get("peRatioTTM"))    or safe_float(inc.get("pe"))
