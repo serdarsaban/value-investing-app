@@ -24,6 +24,11 @@ import requests
 import pandas as pd
 import numpy as np
 import time
+try:
+    import yfinance as yf
+    _YF_AVAILABLE = True
+except ImportError:
+    _YF_AVAILABLE = False
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -123,6 +128,23 @@ def get_company_facts(cik: str) -> dict:
     r = requests.get(url, headers=SEC_HEADERS, timeout=30)
     r.raise_for_status()
     return r.json()
+
+
+@st.cache_data(ttl=300, show_spinner=False)   # 5-min cache — price changes often
+def get_price_yf(ticker: str) -> float | None:
+    """
+    Fetch the current stock price from Yahoo Finance via yfinance.
+    Falls back to None if yfinance is unavailable or the ticker isn't found.
+    Cache TTL is 5 minutes so the price stays reasonably fresh.
+    """
+    if not _YF_AVAILABLE:
+        return None
+    try:
+        info = yf.Ticker(ticker).fast_info
+        price = getattr(info, "last_price", None) or getattr(info, "regular_market_price", None)
+        return float(price) if price else None
+    except Exception:
+        return None
 
 
 def pick_annual(entries: list, prefer_fy: int = None) -> dict | None:
@@ -476,16 +498,17 @@ def compute_valuations(d, r, g, lifo_reserve=0.0, manual_price=None):
     v["operating_cf_for_cap"] = op_cf
 
     # ── PEG (Ch. 11) ──────────────────────────────────────────────────────────
-    pe = safe_div(price, d.get("eps")) if price and d.get("eps") else None
-    d["pe_ratio"] = pe
+    # Store in v[] not d[] — d is cached, v is recomputed every run.
+    # This ensures ratios always reflect the current manually-entered price.
+    v["pe_ratio"] = safe_div(price, d.get("eps")) if price and d.get("eps") else None
     g_pct = (d.get("earnings_growth") or d.get("revenue_growth") or g) * 100
-    v["peg"] = safe_div(pe, g_pct) if pe and g_pct else None
+    v["peg"] = safe_div(v["pe_ratio"], g_pct) if v["pe_ratio"] and g_pct else None
 
     # ── P/B and P/S ───────────────────────────────────────────────────────────
-    d["pb_ratio"] = safe_div(price, d.get("book_value_ps")) \
+    v["pb_ratio"] = safe_div(price, d.get("book_value_ps")) \
                     if price and d.get("book_value_ps") else None
     rev_ps = safe_div(d.get("revenue"), shares)
-    d["ps_ratio"] = safe_div(price, rev_ps) if price and rev_ps else None
+    v["ps_ratio"] = safe_div(price, rev_ps) if price and rev_ps else None
 
     # ── Sonkin Adjusted P/E  (Ch. 16) ─────────────────────────────────────────
     net_cash    = cash - total_debt
@@ -524,24 +547,28 @@ def peg_signal(peg):
 
 with st.sidebar:
     st.markdown("## 📊 Value Investing Toolkit")
-    st.caption("Greenwald · Graham · Hooke  ·  Data: SEC EDGAR")
+    st.caption("Greenwald · Graham · Hooke  ·  Data: SEC EDGAR + Yahoo Finance")
     st.divider()
 
-    st.markdown("**No API key needed** — data comes directly from SEC 10-K filings.")
+    st.markdown("**No API key needed** — fundamentals from SEC 10-K · price from Yahoo Finance.")
     st.caption("US stocks only (SEC filers). International stocks not supported.")
 
     ticker_input = st.text_input("Ticker Symbol", value="AAPL", max_chars=10).upper().strip()
 
     st.markdown("#### 💵 Current Stock Price")
+    # Auto-fetch from Yahoo Finance; user can override manually
+    _auto_price = get_price_yf(ticker_input) if ticker_input else None
+    _price_default = round(float(_auto_price), 2) if _auto_price else 0.0
     manual_price = st.number_input(
-        "Enter current price ($)",
-        min_value=0.0, value=0.0, step=0.01, format="%.2f",
-        help="EDGAR doesn't provide live prices. Enter the current market price manually "
-             "to enable Margin of Safety, P/E, P/B, P/S, and Cap Rate calculations."
+        "Current price ($)",
+        min_value=0.0, value=_price_default, step=0.01, format="%.2f",
+        help="Auto-fetched from Yahoo Finance. You can edit this to use a different price."
     )
     manual_price = manual_price if manual_price > 0 else None
-    if not manual_price:
-        st.caption("💡 Price needed for MoS and market multiples.")
+    if _auto_price:
+        st.caption(f"📡 Yahoo Finance live price: ${_auto_price:,.2f}")
+    else:
+        st.caption("⚠️ Could not fetch price — enter manually.")
 
     st.markdown("#### Assumptions")
     r = st.slider("Cost of Capital (R)", 0.04, 0.20, 0.09, 0.005, format="%.3f",
@@ -560,7 +587,7 @@ with st.sidebar:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 st.title("📊 Value Investing Toolkit")
-st.caption("Based on *Value Investing: From Graham to Buffett and Beyond* (Greenwald et al.)  ·  Data: SEC EDGAR (free, no API key)")
+st.caption("Based on *Value Investing: From Graham to Buffett and Beyond* (Greenwald et al.)  ·  Fundamentals: SEC EDGAR · Price: Yahoo Finance")
 
 if g >= r:
     st.error("⚠️ G must be < R. (Ch. 7: if G ≥ R, value becomes infinite.)")
@@ -607,7 +634,7 @@ cc.metric("Market Cap", fmt_currency(v["market_cap"]))
 cd.metric("Fiscal Year", str(d.get("fiscal_year", "N/A")))
 
 if not manual_price:
-    st.warning("💡 Enter the current stock price in the sidebar to unlock Margin of Safety, P/E, P/B, cap rate, and all price-based signals.")
+    st.info("💡 Price could not be fetched automatically. Enter it in the sidebar to unlock all price-based metrics.")
 
 st.divider()
 
@@ -638,9 +665,9 @@ with tab1:
 
     st.markdown('<div class="section-header">Market Multiples (requires price)</div>', unsafe_allow_html=True)
     mc1, mc2, mc3, mc4 = st.columns(4)
-    mc1.metric("P/E Ratio",  fmt_x(d["pe_ratio"])  if d["pe_ratio"]  else "Enter price →")
-    mc2.metric("P/B Ratio",  fmt_x(d["pb_ratio"])  if d["pb_ratio"]  else "Enter price →")
-    mc3.metric("P/S Ratio",  fmt_x(d["ps_ratio"])  if d["ps_ratio"]  else "Enter price →")
+    mc1.metric("P/E Ratio",  fmt_x(v["pe_ratio"])  if v["pe_ratio"]  else "Enter price →")
+    mc2.metric("P/B Ratio",  fmt_x(v["pb_ratio"])  if v["pb_ratio"]  else "Enter price →")
+    mc3.metric("P/S Ratio",  fmt_x(v["ps_ratio"])  if v["ps_ratio"]  else "Enter price →")
     mc4.metric("EPS (Dil.)", f"${d['eps']:,.2f}"   if d.get("eps")   else "N/A")
 
     st.markdown('<div class="section-header">Profitability</div>', unsafe_allow_html=True)
@@ -830,7 +857,7 @@ with tab5:
                                                   else ("⚠️ HOLD" if (v["mos_pct"] or 0) >= 0.10
                                                   else ("🔴 SELL" if v["mos_pct"] is not None else "—")))),
         ("Valuation", "DDM / Share",             f"${v['ddm_per_share']:,.2f}" if v["ddm_per_share"] else "N/A", "—"),
-        ("Valuation", "P/E Ratio",               fmt_x(d["pe_ratio"]) if d["pe_ratio"] else "Enter price →", "—"),
+        ("Valuation", "P/E Ratio",               fmt_x(v["pe_ratio"]) if v["pe_ratio"] else "Enter price →", "—"),
         ("Growth",    "ROIC",                    fmt_pct(d.get("roic")) if d.get("roic") else "N/A",
                                                  "✅ ROC>R" if (d.get("roic") or 0) > r
                                                  else ("⚠️ ROC≈R" if abs((d.get("roic") or 0) - r) < 0.02 else "🔴 ROC<R")),
