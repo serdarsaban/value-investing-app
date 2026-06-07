@@ -711,6 +711,330 @@ def compute_valuations(d, r, g, lifo_reserve=0.0, manual_price=None):
 
 # ── Signals ───────────────────────────────────────────────────────────────────
 
+
+
+# ── HTML Report Generation ────────────────────────────────────────────────────
+
+def generate_html_report(d: dict, v: dict, r: float, g: float,
+                         ticker: str, manual_price) -> str:
+    """
+    Generate a self-contained HTML valuation report.
+    No external dependencies — pure Python string formatting.
+    Opens in any browser, printable, saveable.
+    """
+    price    = manual_price
+    fy       = d.get("fiscal_year", "N/A")
+    date_str = pd.Timestamp.now().strftime("%d %b %Y")
+    da_add   = (d.get("da") or 0) * 0.25
+    mos_pct  = v.get("mos_pct") or 0
+    mos_sig  = ("BUY" if mos_pct >= 0.33 else "HOLD" if mos_pct >= 0.10 else "SELL")
+    mos_col  = ("#1a7a4a" if mos_sig == "BUY" else "#b8973a" if mos_sig == "HOLD" else "#9a2020")
+
+    def row(label, value, note=""):
+        note_td = f'<td class="note">{note}</td>' if note else '<td></td>'
+        return f'<tr><td class="label">{label}</td><td class="value">{value}</td>{note_td}</tr>'
+
+    def pair_row(l1, v1, l2, v2):
+        return (f'<tr>'
+                f'<td class="label">{l1}</td><td class="value">{v1}</td>'
+                f'<td class="label" style="padding-left:24px">{l2}</td><td class="value">{v2}</td>'
+                f'</tr>')
+
+    def section(title, book_note=""):
+        note_html = f'<div class="book-note">📖 {book_note}</div>' if book_note else ""
+        return f'<h2 class="section">{title}</h2>{note_html}'
+
+    def sig_badge(text, color):
+        return f'<span class="badge" style="background:{color}">{text}</span>'
+
+    roc_used = d.get("roic") or d.get("roe") or 0
+    roc_note = ("ROC > R — growth creates value" if roc_used > r
+                else "ROC ≈ R — growth is neutral" if abs(roc_used - r) < 0.01
+                else "ROC < R — growth destroys value")
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{ticker} — Value Investing Report — {date_str}</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: 'IBM Plex Sans', sans-serif; background: #f7f7f9;
+          color: #1a1a2a; font-size: 14px; line-height: 1.6; }}
+  .page {{ max-width: 900px; margin: 0 auto; padding: 40px 32px; }}
+
+  /* Header */
+  .header {{ background: #0f0f1a; color: white; border-radius: 8px;
+             padding: 28px 32px; margin-bottom: 8px;
+             display: flex; justify-content: space-between; align-items: center; }}
+  .header h1 {{ font-family: 'IBM Plex Mono', monospace; font-size: 26px;
+                font-weight: 600; letter-spacing: -0.5px; }}
+  .header .ticker {{ font-family: 'IBM Plex Mono', monospace; font-size: 32px;
+                     color: #c9a84c; font-weight: 700; }}
+  .meta {{ color: #888; font-size: 12px; margin-bottom: 28px;
+           padding: 8px 4px; border-bottom: 1px solid #dde; }}
+
+  /* Sections */
+  h2.section {{ font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+                text-transform: uppercase; letter-spacing: 2px; color: #888;
+                border-bottom: 1px solid #dde; padding-bottom: 6px;
+                margin: 32px 0 10px; }}
+
+  /* Book notes */
+  .book-note {{ background: #f0f0f8; border-left: 3px solid #c9a84c;
+                padding: 8px 14px; border-radius: 4px; font-size: 12px;
+                color: #555; font-style: italic; margin-bottom: 10px; }}
+
+  /* Tables */
+  table {{ width: 100%; border-collapse: collapse; margin-bottom: 4px; }}
+  td {{ padding: 7px 10px; vertical-align: middle; }}
+  tr:nth-child(even) {{ background: #f4f4f8; }}
+  tr:nth-child(odd)  {{ background: #ffffff; }}
+  td.label {{ color: #555; font-size: 12px; width: 28%; }}
+  td.value {{ font-family: 'IBM Plex Mono', monospace; font-weight: 600;
+              font-size: 15px; color: #0f0f1a; width: 22%; }}
+  td.note  {{ color: #888; font-size: 11px; font-style: italic; }}
+  th {{ background: #0f0f1a; color: white; padding: 8px 10px;
+        font-size: 11px; text-align: left; font-weight: 600;
+        font-family: 'IBM Plex Mono', monospace; text-transform: uppercase;
+        letter-spacing: 0.5px; }}
+
+  /* Signal banner */
+  .signal-banner {{ border-radius: 6px; padding: 14px 20px; text-align: center;
+                    color: white; font-family: 'IBM Plex Mono', monospace;
+                    font-weight: 700; font-size: 16px; margin: 12px 0; }}
+  .badge {{ display: inline-block; padding: 3px 10px; border-radius: 4px;
+            color: white; font-size: 11px; font-weight: 700;
+            font-family: 'IBM Plex Mono', monospace; }}
+
+  /* Three-slice visual */
+  .slices {{ display: flex; gap: 12px; margin: 12px 0; }}
+  .slice {{ flex: 1; background: white; border: 1px solid #dde; border-radius: 6px;
+            padding: 16px; text-align: center; }}
+  .slice .slice-label {{ font-size: 11px; color: #888; text-transform: uppercase;
+                         letter-spacing: 1px; margin-bottom: 6px; }}
+  .slice .slice-val {{ font-family: 'IBM Plex Mono', monospace; font-size: 20px;
+                       font-weight: 700; color: #0f0f1a; }}
+  .slice.highlight {{ border-color: #c9a84c; background: #fffbf0; }}
+
+  /* Signal table */
+  .sig-buy  {{ color: #1a7a4a; font-weight: 700; }}
+  .sig-sell {{ color: #9a2020; font-weight: 700; }}
+  .sig-hold {{ color: #b8973a; font-weight: 700; }}
+
+  /* Footer */
+  .footer {{ margin-top: 48px; padding-top: 16px; border-top: 1px solid #dde;
+             font-size: 11px; color: #aaa; text-align: center; }}
+
+  @media print {{
+    body {{ background: white; }}
+    .page {{ padding: 20px; }}
+  }}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- Header -->
+  <div class="header">
+    <div>
+      <div class="ticker">{ticker}</div>
+      <h1>{d.get("name","")}</h1>
+    </div>
+    <div style="text-align:right; color:#aaa; font-size:13px; line-height:1.8">
+      <div>SEC EDGAR · TTM / {fy} 10-K</div>
+      <div>{date_str}</div>
+      <div>R = {fmt_pct(r)} · G = {fmt_pct(g)}</div>
+    </div>
+  </div>
+  <div class="meta">
+    Based on <em>Value Investing: From Graham to Buffett and Beyond</em>
+    (Greenwald, Kahn, Sonkin, van Biema) &nbsp;·&nbsp;
+    Data: SEC EDGAR XBRL (free, no API key)
+  </div>
+
+  <!-- 1. Key Financials -->
+  {section("1. Key Financials (TTM)")}
+  <table>
+    {pair_row("Revenue",      fmt_currency(d.get("revenue")),
+               "Net Income",   fmt_currency(d.get("net_income")))}
+    {pair_row("EBIT",          fmt_currency(d.get("ebit")),
+               "EBITDA",       fmt_currency(d.get("ebitda")))}
+    {pair_row("Gross Margin",  fmt_pct(d.get("gross_margin")),
+               "Op. Margin",   fmt_pct(d.get("operating_margin")))}
+    {pair_row("Net Margin",    fmt_pct(d.get("net_margin")),
+               "ROE",          fmt_pct(d.get("roe")))}
+    {pair_row("Total Debt",    fmt_currency(d.get("total_debt")),
+               "Cash",         fmt_currency(d.get("cash")))}
+    {pair_row("Total Equity",  fmt_currency(d.get("total_equity")),
+               "Capex",        fmt_currency(d.get("capex")))}
+    {pair_row("EPS (TTM)",     f"${d['eps']:,.2f}" if d.get("eps") else "N/A",
+               "Price",        f"${price:,.2f}" if price else "N/A")}
+    {pair_row("Market Cap",    fmt_currency(v.get("market_cap")),
+               "EV",           fmt_currency(v.get("ev")))}
+  </table>
+
+  <!-- 2. Three-Slice Valuation -->
+  {section("2. Three-Slice Valuation (Ch. 3)",
+           "Safety hierarchy: Asset Value (most reliable) → EPV (zero-growth) → "
+           "PV with Growth (least reliable). Ideal buy: Price < EPV < PV with Growth.")}
+  <div class="slices">
+    <div class="slice">
+      <div class="slice-label">① Asset Value</div>
+      <div class="slice-val">{fmt_currency(v.get("reproduction_cost"))}</div>
+      <div style="font-size:11px;color:#888;margin-top:4px">Book equity + LIFO reserve (Ch. 4)</div>
+    </div>
+    <div class="slice highlight">
+      <div class="slice-label">② EPV (zero-growth)</div>
+      <div class="slice-val">{fmt_currency(v.get("epv_total"))}</div>
+      <div style="font-size:11px;color:#888;margin-top:4px">NOPAT ÷ R, debt/cash adjusted (Ch. 3)</div>
+    </div>
+    <div class="slice">
+      <div class="slice-label">③ PV with Growth</div>
+      <div class="slice-val">{fmt_currency(v.get("pv_with_growth")) if v.get("pv_with_growth") else "N/A"}</div>
+      <div style="font-size:11px;color:#888;margin-top:4px">C × (ROC−G)/(R−G) (Ch. 7)</div>
+    </div>
+    <div class="slice">
+      <div class="slice-label">Market Cap</div>
+      <div class="slice-val">{fmt_currency(v.get("market_cap"))}</div>
+      <div style="font-size:11px;color:#888;margin-top:4px">Current market price × shares</div>
+    </div>
+  </div>
+
+  <!-- 3. EPV Build-up -->
+  {section("3. EPV Build-up (Ch. 6 / 7)",
+           "EPV = (NOPAT + 25% D&A) ÷ R − Debt + Surplus Cash. "
+           "Start with EBIT (not net income) to remove capital-structure distortions.")}
+  <table>
+    {row("EBIT (Operating Income)",  fmt_currency(d.get("ebit")),
+         "Ch. 6: preferred starting point — excludes interest")}
+    {row("Tax Rate",                  fmt_pct(d.get("tax_rate")), "")}
+    {row("NOPAT = EBIT × (1 − tax)", fmt_currency(d.get("nopat")), "")}
+    {row("D&A Addback (25%)",         fmt_currency(da_add),
+         "Ch. 7 Intel: conservative maintenance capex buffer")}
+    {row("Surplus Cash Added",        fmt_currency(d.get("surplus_cash")),
+         "Ch. 7: cash > 1% of sales belongs to equity holders")}
+    {row("Debt Subtracted",           fmt_currency(d.get("total_debt")),
+         "Ch. 7: converts enterprise EPV to equity EPV")}
+    {row("EPV per Share",             f"${v['epv_per_share']:,.2f}" if v.get("epv_per_share") else "N/A", "")}
+  </table>
+
+  <!-- 4. Margin of Safety -->
+  {section("4. Margin of Safety (Ch. 3 / Graham)",
+           "MoS = (EPV − Price) / EPV. ≥33% = adequate protection. ≥50% = strong buy. "
+           "Negative MoS = market pricing in growth — only justified with confirmed franchise.")}
+  <table>
+    {pair_row("EPV / Share",    f"${v['epv_per_share']:,.2f}" if v.get("epv_per_share") else "N/A",
+               "Current Price", f"${price:,.2f}" if price else "N/A")}
+    {pair_row("MoS per Share",  f"${v['mos_per_share']:,.2f}" if v.get("mos_per_share") else "N/A",
+               "MoS %",         fmt_pct(v.get("mos_pct")))}
+  </table>
+  <div class="signal-banner" style="background:{mos_col}">
+    Signal: {mos_sig} &nbsp;({fmt_pct(v.get("mos_pct"))} Margin of Safety)
+  </div>
+
+  <!-- 5. Growth Analysis -->
+  {section("5. Growth Analysis (Ch. 7)",
+           "PV = C × (ROC − G) / (R − G). F > 1 = growth creates value (requires ROC > R). "
+           "Growth only adds value within the franchise — not outside it.")}
+  <table>
+    {pair_row("ROIC",              fmt_pct(d.get("roic")),
+               "ROE",              fmt_pct(d.get("roe")))}
+    {pair_row("Growth Factor F",   fmt_x(v.get("growth_factor_F")),
+               "Growth Mult. M",   fmt_x(v.get("growth_mult_M")))}
+    {pair_row("EPV / Share",       f"${v['epv_per_share']:,.2f}" if v.get("epv_per_share") else "N/A",
+               "PV / Share (growth)", f"${v['pv_per_share']:,.2f}" if v.get("pv_per_share") else "N/A")}
+    {pair_row("Revenue Growth",    fmt_pct(d.get("revenue_growth")),
+               "Earnings Growth",  fmt_pct(d.get("earnings_growth")))}
+  </table>
+  <div class="book-note">
+    {'✅ ' + roc_note if roc_used > r else '⚠️ ' + roc_note if abs(roc_used - r) < 0.01 else '🔴 ' + roc_note}
+    &nbsp; ROC = {fmt_pct(roc_used)}, R = {fmt_pct(r)}
+  </div>
+
+  <!-- 6. Franchise & Asset Analysis -->
+  {section("6. Franchise & Asset Analysis (Ch. 4, 5)",
+           "Franchise Value = EPV − Reproduction Cost. "
+           "Positive = the company earns above a competitive return on its assets. "
+           "Without barriers to entry, competition forces returns to cost of capital.")}
+  <table>
+    {row("Franchise Value",    fmt_currency(v.get("franchise_value")),
+         "Moat confirmed" if (v.get("franchise_value") or 0) > 0 else "No franchise evidence")}
+    {row("NOPAT",              fmt_currency(d.get("nopat")), "")}
+    {row("Invested Capital",   fmt_currency(d.get("invested_capital")),
+         "Equity + Debt − Surplus Cash")}
+    {row("Surplus Cash",       fmt_currency(d.get("surplus_cash")),
+         "Ch. 7: cash above 1% of revenue")}
+    {row("ROIC",               fmt_pct(d.get("roic")),
+         f"{'ROIC > R — franchise confirmed' if (d.get('roic') or 0) > r else 'ROIC ≤ R'}")}
+  </table>
+
+  <!-- 7. Market Multiples -->
+  {section("7. Market Multiples")}
+  <table>
+    {pair_row("P/E Ratio (TTM)",    fmt_x(v.get("pe_ratio")),
+               "EPS (TTM)",         f"${d['eps']:,.2f}" if d.get("eps") else "N/A")}
+    {pair_row("P/B Ratio",          fmt_x(v.get("pb_ratio")),
+               "P/S Ratio",         fmt_x(v.get("ps_ratio")))}
+    {pair_row("Cap Rate (Gabelli)", fmt_pct(v.get("cap_rate")),
+               "Sonkin Adj. P/E",   fmt_x(v.get("sonkin_pe")))}
+    {pair_row("DDM / Share",        f"${v['ddm_per_share']:,.2f}" if v.get("ddm_per_share") else "N/A",
+               "PEG Ratio",         fmt_x(v.get("peg")))}
+  </table>
+
+  <!-- 8. Summary Signals -->
+  {section("8. Summary Signals")}
+  <table>
+    <tr>
+      <th style="width:35%">Metric</th>
+      <th style="width:25%">Value</th>
+      <th>Signal</th>
+    </tr>
+    {"".join([
+      f'<tr><td class="label">{m}</td><td class="value" style="font-size:13px">{val_}</td>'
+      f'<td class="{cls}">{sig}</td></tr>'
+      for m, val_, sig, cls in [
+        ("Margin of Safety",  fmt_pct(v.get("mos_pct")),
+         mos_sig,
+         "sig-buy" if mos_sig=="BUY" else "sig-sell" if mos_sig=="SELL" else "sig-hold"),
+        ("ROIC vs R",         fmt_pct(d.get("roic")),
+         "ROC > R ✅" if (d.get("roic") or 0) > r else "ROC < R 🔴",
+         "sig-buy" if (d.get("roic") or 0) > r else "sig-sell"),
+        ("Growth Factor F",   fmt_x(v.get("growth_factor_F")),
+         "Value-creating ✅" if (v.get("growth_factor_F") or 0) > 1 else "Neutral/Destroying",
+         "sig-buy" if (v.get("growth_factor_F") or 0) > 1 else "sig-hold"),
+        ("Franchise Value",   fmt_currency(v.get("franchise_value")),
+         "Moat confirmed ✅" if (v.get("franchise_value") or 0) > 0 else "No moat",
+         "sig-buy" if (v.get("franchise_value") or 0) > 0 else "sig-hold"),
+        ("Cap Rate",          fmt_pct(v.get("cap_rate")),
+         "Attractive >8% ✅" if (v.get("cap_rate") or 0) >= 0.08
+          else "Fair 5–8%" if (v.get("cap_rate") or 0) >= 0.05 else "Expensive <5% 🔴",
+         "sig-buy" if (v.get("cap_rate") or 0) >= 0.08
+          else "sig-hold" if (v.get("cap_rate") or 0) >= 0.05 else "sig-sell"),
+        ("P/E Ratio (TTM)",   fmt_x(v.get("pe_ratio")), "—", ""),
+        ("Sonkin Adj. P/E",   fmt_x(v.get("sonkin_pe")), "—", ""),
+      ]
+    ])}
+  </table>
+
+  <!-- Footer -->
+  <div class="footer">
+    Generated by Value Investing Toolkit &nbsp;·&nbsp;
+    Data: SEC EDGAR XBRL (free, no API key) &nbsp;·&nbsp;
+    {date_str} &nbsp;·&nbsp;
+    For research purposes only — not financial advice.
+    Verify all data independently.
+  </div>
+
+</div>
+</body>
+</html>"""
+
+    return html
+
+
 def mos_signal(mos_pct):
     if mos_pct is None: return signal_html("N/A", "signal-na")
     if mos_pct >= 0.33: return signal_html(f"▲ BUY  ({fmt_pct(mos_pct)} MoS)", "signal-buy")
@@ -814,7 +1138,7 @@ d = extract_financials(facts, ticker)
 v = compute_valuations(d, r, g, lifo_reserve, manual_price)
 
 # ── Header ─────────────────────────────────────────────────────────────────────
-ca, cb, cc, cd = st.columns([3, 1, 1, 1])
+ca, cb, cc, cd, ce = st.columns([3, 1, 1, 1, 1])
 with ca:
     st.subheader(f"{d['name']}  [{ticker}]")
     fy_label = f"FY{d['fiscal_year']}" if d.get("fiscal_year") else "FY data"
@@ -822,6 +1146,16 @@ with ca:
 cb.metric("Price",      f"${manual_price:,.2f}" if manual_price else "Enter →")
 cc.metric("Market Cap", fmt_currency(v["market_cap"]))
 cd.metric("Fiscal Year", str(d.get("fiscal_year", "N/A")))
+with ce:
+    html_report = generate_html_report(d, v, r, g, ticker, manual_price)
+    st.download_button(
+        label="⬇️ Report",
+        data=html_report,
+        file_name=f"{ticker}_valuation_{pd.Timestamp.now().strftime('%Y%m%d')}.html",
+        mime="text/html",
+        use_container_width=True,
+        help="Download full valuation report as HTML (open in any browser)",
+    )
 
 if not manual_price:
     st.info("💡 Price could not be fetched automatically. Enter it in the sidebar to unlock all price-based metrics.")
