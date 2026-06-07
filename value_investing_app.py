@@ -328,19 +328,68 @@ def prior_annual_val(entries: list) -> float | None:
 
 def ttm_eps(usgaap: dict) -> float | None:
     """
-    Compute TTM diluted EPS by summing the 4 most recent quarterly EPS entries.
-    EDGAR stores EPS in USD/shares units, not USD.
-    We use reported quarterly EPS (Q1+Q2+Q3 + implicit Q4 from annual - prior Qs).
+    Compute TTM diluted EPS = TTM Net Income / TTM Weighted Average Diluted Shares.
+
+    WHY NOT sum quarterly EPS directly?
+    EPS = Net Income / Shares. Shares change every quarter (buybacks, issuances).
+    Summing four per-share figures gives a wrong answer because the denominators differ.
+    The correct method: sum the net income numerators (additive), sum the
+    weighted-average share counts (weighted by time), then divide.
+
+    This matches how Yahoo Finance, Bloomberg, and analysts compute trailing EPS.
     """
-    eps_entries = (
-        usgaap.get("EarningsPerShareDiluted", {}).get("units", {}).get("USD/shares", []) or
-        usgaap.get("EarningsPerShareBasic",   {}).get("units", {}).get("USD/shares", [])
+    # TTM net income (in USD — additive flow)
+    ni_entries = (
+        usgaap.get("NetIncomeLoss", {}).get("units", {}).get("USD", []) or
+        usgaap.get("ProfitLoss",    {}).get("units", {}).get("USD", [])
     )
-    if not eps_entries:
+    ttm_ni = ttm_flow(ni_entries)
+    if ttm_ni is None:
         return None
-    # EPS is already per-share so we can use the same TTM flow logic
-    # but we need to treat it like a flow (summing quarters)
-    return ttm_flow(eps_entries)
+
+    # TTM weighted-average diluted shares (in shares — additive flow, then avg)
+    # EDGAR stores this as "WeightedAverageNumberOfDilutedSharesOutstanding"
+    # Each quarterly entry = that quarter's weighted avg. TTM avg = simple avg of 4 Qs.
+    sh_entries = usgaap.get(
+        "WeightedAverageNumberOfDilutedSharesOutstanding", {}
+    ).get("units", {}).get("shares", [])
+    if not sh_entries:
+        sh_entries = usgaap.get(
+            "WeightedAverageNumberOfSharesOutstandingDiluted", {}
+        ).get("units", {}).get("shares", [])
+
+    # Get the 4 most recent quarterly entries
+    quarters = sorted(
+        [e for e in sh_entries
+         if e.get("form") in ("10-Q","10-Q/A","10-K","10-K/A")
+         and e.get("fp") in ("Q1","Q2","Q3","FY")],
+        key=lambda x: x.get("end",""), reverse=True
+    )
+    # Deduplicate by end date
+    by_end: dict = {}
+    for q in quarters:
+        end = q.get("end","")
+        if end not in by_end or q.get("filed","") > by_end[end].get("filed",""):
+            by_end[end] = q
+    recent_4 = sorted(by_end.values(), key=lambda x: x.get("end",""), reverse=True)[:4]
+
+    if len(recent_4) == 4:
+        avg_shares = sum(safe_float(q.get("val")) or 0 for q in recent_4) / 4
+    elif recent_4:
+        avg_shares = safe_float(recent_4[0].get("val"))
+    else:
+        avg_shares = None
+
+    if avg_shares and avg_shares > 0:
+        return safe_div(ttm_ni, avg_shares)
+
+    # Fallback: latest annual EPS from 10-K
+    eps_ann = sorted(
+        [e for e in usgaap.get("EarningsPerShareDiluted",{}).get("units",{}).get("USD/shares",[])
+         if e.get("form") in ("10-K","10-K/A") and e.get("fp")=="FY"],
+        key=lambda x: x.get("end",""), reverse=True
+    )
+    return safe_float(eps_ann[0].get("val")) if eps_ann else None
 
 
 # ── Map EDGAR concepts → financial dict ──────────────────────────────────────
