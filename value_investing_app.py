@@ -660,11 +660,14 @@ def compute_valuations(d, r, g, lifo_reserve=0.0, manual_price=None):
     else:
         v["pv_with_growth"] = v["pv_per_share"] = None
 
-    # Growth Multiplier M (Ch. 7)
+    # Growth Multiplier M (Ch. 7):  M = [1 − (G/R)(R/ROC)] / [1 − G/R]
+    # Represents PV/EPV — how many times the no-growth value the growing firm is worth.
+    # Verified: M ≈ PV_per_share / EPV_per_share when both use the same capital base.
     if r > 0 and roc and roc > 0:
-        gr    = g / r
-        denom = 1 - gr * (r / roc)
-        v["growth_mult_M"] = safe_div(1 - gr, denom) if denom != 0 else None
+        gr    = g / r           # G/R
+        numer = 1 - gr * (r / roc)   # 1 − (G/R)(R/ROC)
+        denom = 1 - gr                # 1 − G/R
+        v["growth_mult_M"] = safe_div(numer, denom) if denom != 0 else None
     else:
         v["growth_mult_M"] = None
 
