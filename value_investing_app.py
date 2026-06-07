@@ -70,8 +70,9 @@ st.markdown("""
   .call-meter {
     font-family: 'IBM Plex Mono', monospace; font-size: 12px;
     background: #111; border: 1px solid #333; border-radius: 6px;
-    padding: 8px 12px; margin: 6px 0;
+    padding: 8px 12px; margin: 6px 0; line-height: 1.9;
   }
+  .call-meter p { margin: 0; }
   .stTabs [data-baseweb="tab"] { font-family: 'IBM Plex Mono', monospace; font-size: 12px; }
 </style>
 """, unsafe_allow_html=True)
@@ -570,10 +571,10 @@ with st.sidebar:
 
     st.markdown(
         f'<div class="call-meter">'
-        f'🔋 Session calls used: <b>{calls_used}</b> (resets on page reload)<br>'
-        f'📊 Next run: <b>{cache_note}</b><br>'
-        f'🔄 ~{analyses_left} fresh analyses left this session<br>'
-        f'<span style="color:#888;font-size:11px">Free tier: 25 calls/day total across all sessions</span>'
+        f'🔋 Session calls: <b>{calls_used}</b> used (resets on reload)<br/>'
+        f'📊 Next run: <b>{cache_note}</b><br/>'
+        f'🔄 ~<b>{analyses_left}</b> fresh analyses left this session<br/>'
+        f'<small style="color:#666">Free tier: 25 calls/day across all sessions</small>'
         f'</div>',
         unsafe_allow_html=True
     )
@@ -1007,4 +1008,3 @@ with tab5:
         "'The greater the margin of safety, the lower the risk.' — Ch. 3"
     ), unsafe_allow_html=True)
     st.caption("⚠️ Research only — not financial advice. Verify all data independently.")
-  
