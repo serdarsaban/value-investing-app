@@ -113,23 +113,30 @@ def book_note(text):
 
 # ── FMP fetch layer ───────────────────────────────────────────────────────────
 
-BASE = "https://financialmodelingprep.com/stable"
+BASE_V3     = "https://financialmodelingprep.com/api/v3"
+BASE_STABLE = "https://financialmodelingprep.com/stable"
 
 @st.cache_data(ttl=28800, show_spinner=False)   # 8-hour cache per (endpoint, ticker)
-def fmp_get(endpoint, ticker, api_key, **params):
+def fmp_get(endpoint, ticker, api_key, base=None, **params):
     """
     Single FMP call. Cached 8 hours per (endpoint, ticker).
     Re-running the same ticker costs zero calls within the cache window.
-    FMP free tier: 250 calls/day, no per-minute limit worth worrying about.
+    FMP free tier: 250 calls/day.
+
+    FMP has two URL schemes:
+      api/v3  — legacy endpoints: profile, income-statement, balance-sheet-statement,
+                cash-flow-statement, historical-price-full, key-metrics-ttm
+      stable/ — newer endpoints (used for a minority of calls)
+    All financial statement endpoints live under api/v3.
     """
-    url = f"{BASE}/{endpoint}/{ticker}"
+    b = base or BASE_V3
+    url = f"{b}/{endpoint}/{ticker}"
     p = {"apikey": api_key}
     p.update(params)
     r = requests.get(url, params=p, timeout=15)
     r.raise_for_status()
     data = r.json()
-    # FMP returns a list for statements, dict for errors
-    if isinstance(data, dict):
+    if isinstance(data, dict) and ("message" in data or "error" in data):
         msg = data.get("message") or data.get("error") or str(data)
         raise RuntimeError(f"FMP error: {msg}")
     return data
@@ -173,9 +180,10 @@ def fetch_data(ticker, api_key, mode):
     if mode == "Chart (6 calls)":
         get("key-metrics-ttm",         "metrics")
         # historical-price-full returns {"symbol":…,"historical":[…]}
+        # historical-price-full: ticker goes in the path under api/v3
         raw["history"] = fmp_get(
             "historical-price-full", ticker, api_key,
-            timeseries=252
+            serietype="line", timeseries=252
         )
         time.sleep(0.25)
 
