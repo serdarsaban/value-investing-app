@@ -185,89 +185,113 @@ def val(entry: dict | None) -> float | None:
     return safe_float(entry.get("val"))
 
 
+def _dedup_by_end(entries: list) -> list:
+    """Keep only the latest-filed entry for each unique end date."""
+    by_end: dict = {}
+    for e in entries:
+        end = e.get("end", "")
+        if end not in by_end or e.get("filed","") > by_end[end].get("filed",""):
+            by_end[end] = e
+    return list(by_end.values())
+
+
+def _best_annual(entries: list) -> dict | None:
+    """
+    Return the single best 10-K FY entry: deduplicate by fiscal year
+    (keep latest filed), then return the most recent FY.
+    """
+    annuals = [e for e in entries
+               if e.get("form") in ("10-K","10-K/A") and e.get("fp") == "FY"]
+    if not annuals:
+        return None
+    by_fy: dict = {}
+    for e in annuals:
+        fy = e.get("fy")
+        if fy is None:
+            continue
+        if fy not in by_fy or e.get("filed","") > by_fy[fy].get("filed",""):
+            by_fy[fy] = e
+    return by_fy[max(by_fy.keys())] if by_fy else None
+
+
 def ttm_flow(entries: list) -> float | None:
     """
-    Compute Trailing Twelve Months value for a FLOW statement concept
-    (revenue, EBIT, net income, D&A, capex, etc.) by summing the 4 most
-    recent non-overlapping quarterly periods from 10-Q and 10-K filings.
+    Compute TTM for a flow concept using the anchor-and-adjust method:
 
-    EDGAR XBRL quarterly entries: each 10-Q entry covers exactly one quarter
-    (fp = Q1, Q2, or Q3). The 10-K entry covers the full year (fp = FY).
-    We reconstruct TTM as: most recent full year + quarters after that year end.
+        TTM = Latest_Annual
+              + sum(post-annual quarters, fp=Q1/Q2/Q3)
+              - same quarters from the prior fiscal year
 
-    Algorithm:
-      1. Collect all quarterly entries (Q1/Q2/Q3 from 10-Qs, implicitly Q4
-         from: FY value - Q1 - Q2 - Q3 of same fiscal year)
-      2. Sort by end date descending, take 4 most recent non-overlapping quarters
-      3. Sum them
+    This is the standard method used by FactSet, Bloomberg, and S&P Capital IQ.
 
-    Fallback: if we can't build 4 clean quarters, use the most recent 10-K annual.
+    Key correctness requirements:
+    1. Use _best_annual() — deduplicates by FY so we always get one clean annual.
+    2. Match post quarters to prior-year quarters by fp code (Q1↔Q1, Q2↔Q2, Q3↔Q3)
+       not by date arithmetic, which breaks for non-Dec fiscal year-ends.
+    3. Fall back to the annual if we can't find matching prior-year quarters.
     """
     if not entries:
         return None
 
-    # Separate annuals and individual quarters
-    annuals  = sorted(
-        [e for e in entries if e.get("form") in ("10-K","10-K/A") and e.get("fp") == "FY"],
-        key=lambda x: x.get("end",""), reverse=True
-    )
-    quarters = sorted(
-        [e for e in entries
-         if e.get("form") in ("10-Q","10-Q/A")
-         and e.get("fp") in ("Q1","Q2","Q3")],
-        key=lambda x: x.get("end",""), reverse=True
-    )
-
-    if not annuals:
+    latest_annual = _best_annual(entries)
+    if latest_annual is None:
         return None
 
-    latest_annual = annuals[0]
-    annual_end    = latest_annual.get("end","")
-    annual_val    = safe_float(latest_annual.get("val"))
+    annual_val = safe_float(latest_annual.get("val"))
+    annual_end = latest_annual.get("end", "")
+    annual_fy  = latest_annual.get("fy")
 
-    # Find any quarters AFTER the latest annual's end date
-    post_quarters = [q for q in quarters if q.get("end","") > annual_end]
-
-    if not post_quarters:
-        # No new quarters yet — the annual IS the TTM
+    if annual_fy is None:
         return annual_val
 
-    # De-duplicate post quarters by end date (keep latest filed for each end)
-    by_end: dict = {}
-    for q in post_quarters:
-        end = q.get("end","")
-        if end not in by_end or q.get("filed","") > by_end[end].get("filed",""):
-            by_end[end] = q
-    post_quarters = sorted(by_end.values(), key=lambda x: x.get("end",""), reverse=True)
+    # All individual quarters (10-Q only, fp = Q1/Q2/Q3), deduped by end date
+    all_quarters = _dedup_by_end([
+        e for e in entries
+        if e.get("form") in ("10-Q","10-Q/A")
+        and e.get("fp") in ("Q1","Q2","Q3")
+    ])
 
-    # We need the matching prior-year quarters to subtract from the annual
-    # TTM = Latest Annual + sum(post quarters) - sum(same quarters from prior year)
-    n = len(post_quarters)
-
-    # Get same-period quarters from prior year for the subtraction
-    # Prior year quarters end within annual_end's fiscal year
-    prior_year_end = str(int(annual_end[:4]) - 1) + annual_end[4:]  # approx
-    prior_quarters = sorted(
-        [e for e in entries
-         if e.get("form") in ("10-Q","10-Q/A")
-         and e.get("fp") in ("Q1","Q2","Q3")
-         and e.get("end","") <= annual_end
-         and e.get("end","") > prior_year_end],
+    # Post-annual quarters: same FY as the annual+1, OR simply end date > annual_end
+    # Using fy = annual_fy+1 is more reliable for non-Dec year-end companies
+    post_qs = sorted(
+        [q for q in all_quarters
+         if q.get("fy") == annual_fy + 1 or q.get("end","") > annual_end],
         key=lambda x: x.get("end",""), reverse=True
     )
 
-    # Match: take the n most recent prior quarters
-    prior_quarters_matched = prior_quarters[:n]
+    if not post_qs:
+        return annual_val   # Annual IS the TTM — no newer quarters yet
 
-    if len(prior_quarters_matched) < n:
-        # Can't subtract cleanly — fall back to annual
+    # Prior-year quarters: same fp codes, fy = annual_fy
+    # e.g. if post has Q1+Q2 of FY2026, we subtract Q1+Q2 of FY2025
+    post_fps  = {q.get("fp") for q in post_qs}   # e.g. {"Q1","Q2"}
+    prior_qs  = [q for q in all_quarters
+                 if q.get("fy") == annual_fy and q.get("fp") in post_fps]
+
+    # Build fp→value maps for clean matching
+    post_by_fp  = {}
+    for q in post_qs:
+        fp = q.get("fp")
+        if fp not in post_by_fp or q.get("filed","") > post_by_fp[fp].get("filed",""):
+            post_by_fp[fp] = q
+
+    prior_by_fp = {}
+    for q in prior_qs:
+        fp = q.get("fp")
+        if fp not in prior_by_fp or q.get("filed","") > prior_by_fp[fp].get("filed",""):
+            prior_by_fp[fp] = q
+
+    # Only include fps where we have BOTH post and prior
+    matched_fps = [fp for fp in post_by_fp if fp in prior_by_fp]
+
+    if not matched_fps:
+        # No prior-year counterparts found — fall back to annual
         return annual_val
 
-    post_sum  = sum(safe_float(q.get("val")) or 0 for q in post_quarters)
-    prior_sum = sum(safe_float(q.get("val")) or 0 for q in prior_quarters_matched)
+    post_sum  = sum(safe_float(post_by_fp[fp].get("val"))  or 0 for fp in matched_fps)
+    prior_sum = sum(safe_float(prior_by_fp[fp].get("val")) or 0 for fp in matched_fps)
 
-    ttm = (annual_val or 0) + post_sum - prior_sum
-    return ttm
+    return (annual_val or 0) + post_sum - prior_sum
 
 
 def latest_snapshot(entries: list) -> float | None:
