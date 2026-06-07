@@ -131,80 +131,40 @@ def get_company_facts(cik: str) -> dict:
 
 
 @st.cache_data(ttl=300, show_spinner=False)   # 5-min cache — price changes often
-def get_price_yf(ticker: str) -> float | None:
+def get_market_data_yf(ticker: str) -> dict:
     """
-    Fetch the current stock price from Yahoo Finance via yfinance.
-    Falls back to None if yfinance is unavailable or the ticker isn't found.
-    Cache TTL is 5 minutes so the price stays reasonably fresh.
+    Fetch live market data from Yahoo Finance in a single Ticker call.
+    Returns dict with keys: price, eps_ttm, pe_ttm, shares_float.
+    All values may be None if unavailable.
+
+    WHY TTM EPS FROM YAHOO?
+    EDGAR 10-K EPS is point-in-time (e.g. ADSK FY2025 = Jan 31 2025).
+    By the time you analyse the stock, that could be 12-16 months stale.
+    Yahoo's trailingEps always covers the most recent 4 quarters — the
+    same figure Yahoo uses for its P/E, so our P/E will match Yahoo's.
     """
+    result = {"price": None, "eps_ttm": None, "pe_ttm": None}
     if not _YF_AVAILABLE:
-        return None
+        return result
     try:
-        info = yf.Ticker(ticker).fast_info
-        price = getattr(info, "last_price", None) or getattr(info, "regular_market_price", None)
-        return float(price) if price else None
+        t    = yf.Ticker(ticker)
+        info = t.info          # full info dict — one network call
+        result["price"]   = safe_float(info.get("currentPrice") or
+                                       info.get("regularMarketPrice") or
+                                       info.get("previousClose"))
+        result["eps_ttm"] = safe_float(info.get("trailingEps"))
+        result["pe_ttm"]  = safe_float(info.get("trailingPE"))
     except Exception:
-        return None
+        pass
+    return result
 
 
-def _best_per_fy(entries: list) -> dict:
-    """
-    Deduplicate XBRL entries by fiscal year: keep the single best entry per FY.
-    'Best' = latest filed date (most recent amendment/restatement wins).
-    Returns dict of {fy: entry}.
-
-    This prevents the common EDGAR artifact where the same concept appears
-    multiple times for the same FY (e.g. original 10-K + 10-K/A amendment),
-    which can cause incorrect values when sorted naively by end date.
-    """
-    by_fy: dict = {}
-    for e in entries:
-        fy = e.get("fy")
-        if fy is None:
-            continue
-        existing = by_fy.get(fy)
-        if existing is None or e.get("filed", "") > existing.get("filed", ""):
-            by_fy[fy] = e
-    return by_fy
+# Keep old name as thin wrapper so sidebar code still works
+def get_price_yf(ticker: str) -> float | None:
+    return get_market_data_yf(ticker).get("price")
 
 
-def pick_annual(entries: list, prefer_fy: int = None) -> dict | None:
-    """
-    Pick the best 10-K annual value from a list of XBRL entries.
-
-    Strategy (fixes the ADSK fiscal-year mismatch bug):
-    1. Filter to 10-K / 10-K/A forms with fp=FY only
-    2. Deduplicate by fiscal year — one entry per FY, latest filing wins
-    3. If prefer_fy given, return that year; otherwise return the most recent FY
-
-    Why deduplicate? EDGAR can have multiple entries for the same concept and
-    the same FY (original + amendments). Sorting by end date alone can pick
-    a restated or partial-year entry over the authoritative annual figure.
-    """
-    annual = [e for e in entries
-              if e.get("form") in ("10-K", "10-K/A")
-              and e.get("fp") == "FY"]
-    if not annual:
-        return None
-    by_fy = _best_per_fy(annual)
-    if not by_fy:
-        return None
-    if prefer_fy and prefer_fy in by_fy:
-        return by_fy[prefer_fy]
-    # Return most recent fiscal year
-    return by_fy[max(by_fy.keys())]
-
-
-def pick_prior_annual(entries: list, latest_fy: int) -> dict | None:
-    """Pick the 10-K entry for the fiscal year immediately before latest_fy."""
-    annual = [e for e in entries
-              if e.get("form") in ("10-K", "10-K/A")
-              and e.get("fp") == "FY"]
-    if not annual:
-        return None
-    by_fy = _best_per_fy(annual)
-    prior_fy = latest_fy - 1
-    return by_fy.get(prior_fy)
+# ── EDGAR XBRL parsing utilities ─────────────────────────────────────────────
 
 def get_concept(facts_usgaap: dict, *concept_names) -> tuple[list, str]:
     """
@@ -225,29 +185,194 @@ def val(entry: dict | None) -> float | None:
     return safe_float(entry.get("val"))
 
 
+def ttm_flow(entries: list) -> float | None:
+    """
+    Compute Trailing Twelve Months value for a FLOW statement concept
+    (revenue, EBIT, net income, D&A, capex, etc.) by summing the 4 most
+    recent non-overlapping quarterly periods from 10-Q and 10-K filings.
+
+    EDGAR XBRL quarterly entries: each 10-Q entry covers exactly one quarter
+    (fp = Q1, Q2, or Q3). The 10-K entry covers the full year (fp = FY).
+    We reconstruct TTM as: most recent full year + quarters after that year end.
+
+    Algorithm:
+      1. Collect all quarterly entries (Q1/Q2/Q3 from 10-Qs, implicitly Q4
+         from: FY value - Q1 - Q2 - Q3 of same fiscal year)
+      2. Sort by end date descending, take 4 most recent non-overlapping quarters
+      3. Sum them
+
+    Fallback: if we can't build 4 clean quarters, use the most recent 10-K annual.
+    """
+    if not entries:
+        return None
+
+    # Separate annuals and individual quarters
+    annuals  = sorted(
+        [e for e in entries if e.get("form") in ("10-K","10-K/A") and e.get("fp") == "FY"],
+        key=lambda x: x.get("end",""), reverse=True
+    )
+    quarters = sorted(
+        [e for e in entries
+         if e.get("form") in ("10-Q","10-Q/A")
+         and e.get("fp") in ("Q1","Q2","Q3")],
+        key=lambda x: x.get("end",""), reverse=True
+    )
+
+    if not annuals:
+        return None
+
+    latest_annual = annuals[0]
+    annual_end    = latest_annual.get("end","")
+    annual_val    = safe_float(latest_annual.get("val"))
+
+    # Find any quarters AFTER the latest annual's end date
+    post_quarters = [q for q in quarters if q.get("end","") > annual_end]
+
+    if not post_quarters:
+        # No new quarters yet — the annual IS the TTM
+        return annual_val
+
+    # De-duplicate post quarters by end date (keep latest filed for each end)
+    by_end: dict = {}
+    for q in post_quarters:
+        end = q.get("end","")
+        if end not in by_end or q.get("filed","") > by_end[end].get("filed",""):
+            by_end[end] = q
+    post_quarters = sorted(by_end.values(), key=lambda x: x.get("end",""), reverse=True)
+
+    # We need the matching prior-year quarters to subtract from the annual
+    # TTM = Latest Annual + sum(post quarters) - sum(same quarters from prior year)
+    n = len(post_quarters)
+
+    # Get same-period quarters from prior year for the subtraction
+    # Prior year quarters end within annual_end's fiscal year
+    prior_year_end = str(int(annual_end[:4]) - 1) + annual_end[4:]  # approx
+    prior_quarters = sorted(
+        [e for e in entries
+         if e.get("form") in ("10-Q","10-Q/A")
+         and e.get("fp") in ("Q1","Q2","Q3")
+         and e.get("end","") <= annual_end
+         and e.get("end","") > prior_year_end],
+        key=lambda x: x.get("end",""), reverse=True
+    )
+
+    # Match: take the n most recent prior quarters
+    prior_quarters_matched = prior_quarters[:n]
+
+    if len(prior_quarters_matched) < n:
+        # Can't subtract cleanly — fall back to annual
+        return annual_val
+
+    post_sum  = sum(safe_float(q.get("val")) or 0 for q in post_quarters)
+    prior_sum = sum(safe_float(q.get("val")) or 0 for q in prior_quarters_matched)
+
+    ttm = (annual_val or 0) + post_sum - prior_sum
+    return ttm
+
+
+def latest_snapshot(entries: list) -> float | None:
+    """
+    Return the most recent VALUE for a BALANCE SHEET concept (point-in-time,
+    not summed). Prefers the most recently filed 10-Q or 10-K entry by end date.
+    Balance sheet items are snapshots — you don't sum them.
+    """
+    if not entries:
+        return None
+    # Accept any form type — 10-Q gives the freshest balance sheet
+    candidates = [e for e in entries if e.get("form") in
+                  ("10-K","10-K/A","10-Q","10-Q/A")]
+    if not candidates:
+        candidates = entries
+    # Sort by end date, then by filed date for ties
+    candidates.sort(key=lambda x: (x.get("end",""), x.get("filed","")), reverse=True)
+    return safe_float(candidates[0].get("val"))
+
+
+def latest_annual_val(entries: list) -> float | None:
+    """
+    Return the most recent 10-K FY value. Used for concepts where quarterly
+    data isn't available or reliable (e.g. goodwill, deferred revenue).
+    Deduplicates by FY, takes most recent.
+    """
+    annuals = [e for e in entries
+               if e.get("form") in ("10-K","10-K/A") and e.get("fp") == "FY"]
+    if not annuals:
+        return None
+    # Deduplicate by FY, keep latest filed
+    by_fy: dict = {}
+    for e in annuals:
+        fy = e.get("fy")
+        if fy is None: continue
+        if fy not in by_fy or e.get("filed","") > by_fy[fy].get("filed",""):
+            by_fy[fy] = e
+    return safe_float(by_fy[max(by_fy.keys())].get("val")) if by_fy else None
+
+
+def prior_annual_val(entries: list) -> float | None:
+    """Return the second-most-recent 10-K FY value (for YOY growth)."""
+    annuals = [e for e in entries
+               if e.get("form") in ("10-K","10-K/A") and e.get("fp") == "FY"]
+    if not annuals:
+        return None
+    by_fy: dict = {}
+    for e in annuals:
+        fy = e.get("fy")
+        if fy is None: continue
+        if fy not in by_fy or e.get("filed","") > by_fy[fy].get("filed",""):
+            by_fy[fy] = e
+    if len(by_fy) < 2:
+        return None
+    sorted_fys = sorted(by_fy.keys(), reverse=True)
+    return safe_float(by_fy[sorted_fys[1]].get("val"))
+
+
+def ttm_eps(usgaap: dict) -> float | None:
+    """
+    Compute TTM diluted EPS by summing the 4 most recent quarterly EPS entries.
+    EDGAR stores EPS in USD/shares units, not USD.
+    We use reported quarterly EPS (Q1+Q2+Q3 + implicit Q4 from annual - prior Qs).
+    """
+    eps_entries = (
+        usgaap.get("EarningsPerShareDiluted", {}).get("units", {}).get("USD/shares", []) or
+        usgaap.get("EarningsPerShareBasic",   {}).get("units", {}).get("USD/shares", [])
+    )
+    if not eps_entries:
+        return None
+    # EPS is already per-share so we can use the same TTM flow logic
+    # but we need to treat it like a flow (summing quarters)
+    return ttm_flow(eps_entries)
+
+
 # ── Map EDGAR concepts → financial dict ──────────────────────────────────────
 
 def extract_financials(facts: dict, ticker: str) -> dict:
     """
-    Parse the companyfacts JSON into the clean dict used by compute_valuations().
+    Parse companyfacts JSON → clean financial dict for compute_valuations().
 
-    EDGAR XBRL concept mapping — companies sometimes use different tags:
-      Revenue:     Revenues | RevenueFromContractWithCustomerExcludingAssessedTax
-                   | SalesRevenueNet | RevenueFromContractWithCustomer
-      EBIT:        OperatingIncomeLoss
-      Net income:  NetIncomeLoss | ProfitLoss
-      Tax:         IncomeTaxExpense | IncomeTaxesPaid
-      Pretax:      IncomeLossFromContinuingOperationsBeforeIncomeTaxes...
-      D&A:         DepreciationDepletionAndAmortization | DepreciationAndAmortization
-      Capex:       PaymentsToAcquirePropertyPlantAndEquipment
-      Cash:        CashAndCashEquivalentsAtCarryingValue | Cash
-                   | CashCashEquivalentsAndShortTermInvestments
-      Total debt:  LongTermDebtAndCapitalLeaseObligation + ShortTermBorrowings
-                   | DebtCurrent + LongTermDebt
-      Equity:      StockholdersEquity | StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest
-      Shares:      CommonStockSharesOutstanding | EntityCommonStockSharesOutstanding
-      Op CF:       NetCashProvidedByUsedInOperatingActivities
-      Dividends:   PaymentsOfDividends | PaymentsOfDividendsCommonStock
+    DATA FRESHNESS STRATEGY:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │ FLOW items (income stmt, cash flow):  TTM = last 4 quarters     │
+    │   ttm_flow() sums Q1+Q2+Q3 post-annual + adjusts prior year    │
+    │   → always current, even mid-fiscal-year                        │
+    │                                                                  │
+    │ BALANCE SHEET items:  latest_snapshot() = most recent 10-Q/10-K │
+    │   → always the freshest balance sheet available                  │
+    │                                                                  │
+    │ EPS:  ttm_eps() = sum of last 4 quarterly EPS figures            │
+    │   → matches Yahoo Finance's "Trailing EPS" exactly              │
+    └─────────────────────────────────────────────────────────────────┘
+
+    EDGAR XBRL concept names used:
+      Revenue:    Revenues | RevenueFromContractWithCustomerExcludingAssessedTax
+                  | SalesRevenueNet
+      EBIT:       OperatingIncomeLoss
+      Net income: NetIncomeLoss | ProfitLoss
+      D&A:        DepreciationDepletionAndAmortization | DepreciationAndAmortization
+      Capex:      PaymentsToAcquirePropertyPlantAndEquipment
+      Cash:       CashAndCashEquivalentsAtCarryingValue | CashCashEquivalentsAndShortTermInvestments
+      Debt:       LongTermDebt + ShortTermBorrowings
+      Equity:     StockholdersEquity
+      Shares:     CommonStockSharesOutstanding
     """
     d = {}
     d["name"]   = facts.get("entityName", ticker)
@@ -256,150 +381,108 @@ def extract_financials(facts: dict, ticker: str) -> dict:
     usgaap = facts.get("facts", {}).get("us-gaap", {})
     dei    = facts.get("facts", {}).get("dei", {})
 
-    # ── Revenue ──────────────────────────────────────────────────────────────
-    rev_entries, _ = get_concept(usgaap,
-        "Revenues",
-        "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "SalesRevenueNet",
-        "RevenueFromContractWithCustomerIncludingAssessedTax",
-    )
-    rev_latest = pick_annual(rev_entries)
-    rev_prior  = pick_prior_annual(rev_entries, rev_latest["fy"]) if rev_latest else None
-    latest_fy  = rev_latest["fy"] if rev_latest else None
+    def gc(*names):
+        """Shorthand: get first matching concept entries."""
+        entries, _ = get_concept(usgaap, *names)
+        return entries
 
-    d["revenue"]       = val(rev_latest)
-    d["revenue_prior"] = val(rev_prior)
-    d["fiscal_year"]   = latest_fy
+    # ── TTM flow items (income statement) ────────────────────────────────────
+    rev_entries = gc("Revenues",
+                     "RevenueFromContractWithCustomerExcludingAssessedTax",
+                     "SalesRevenueNet",
+                     "RevenueFromContractWithCustomerIncludingAssessedTax")
 
-    # ── EBIT (Operating Income) ───────────────────────────────────────────────
-    ebit_entries, _ = get_concept(usgaap, "OperatingIncomeLoss")
-    d["ebit"] = val(pick_annual(ebit_entries, latest_fy))
+    d["revenue"]       = ttm_flow(rev_entries)
+    d["revenue_prior"] = prior_annual_val(rev_entries)   # prior FY for YOY
 
-    # ── Net Income ───────────────────────────────────────────────────────────
-    ni_entries, _ = get_concept(usgaap,
-        "NetIncomeLoss",
-        "ProfitLoss",
-        "NetIncomeLossAvailableToCommonStockholdersBasic",
-    )
-    ni_latest = pick_annual(ni_entries, latest_fy)
-    ni_prior  = pick_prior_annual(ni_entries, latest_fy) if latest_fy else None
-    d["net_income"]       = val(ni_latest)
-    d["net_income_prior"] = val(ni_prior)
+    ebit_entries = gc("OperatingIncomeLoss")
+    d["ebit"]    = ttm_flow(ebit_entries)
 
-    # ── Tax rate ─────────────────────────────────────────────────────────────
-    tax_entries, _ = get_concept(usgaap, "IncomeTaxExpenseBenefit")
-    pretax_entries, _ = get_concept(usgaap,
+    ni_entries        = gc("NetIncomeLoss", "ProfitLoss",
+                           "NetIncomeLossAvailableToCommonStockholdersBasic")
+    d["net_income"]       = ttm_flow(ni_entries)
+    d["net_income_prior"] = prior_annual_val(ni_entries)
+
+    gp_entries     = gc("GrossProfit")
+    d["gross_profit"] = ttm_flow(gp_entries)
+
+    da_entries  = gc("DepreciationDepletionAndAmortization",
+                     "DepreciationAndAmortization", "Depreciation")
+    d["da"]     = abs(ttm_flow(da_entries) or 0)
+    d["ebitda"] = (d["ebit"] or 0) + d["da"] if d["ebit"] else None
+
+    tax_entries    = gc("IncomeTaxExpenseBenefit")
+    pretax_entries = gc(
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
         "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
     )
-    income_tax = val(pick_annual(tax_entries, latest_fy)) or 0
-    pretax     = val(pick_annual(pretax_entries, latest_fy)) or 0
-    if pretax > 0 and income_tax:
-        d["tax_rate"] = min(max(income_tax / pretax, 0.10), 0.45)
+    income_tax_ttm = ttm_flow(tax_entries) or 0
+    pretax_ttm     = ttm_flow(pretax_entries) or 0
+    if pretax_ttm > 0 and income_tax_ttm:
+        d["tax_rate"] = min(max(income_tax_ttm / pretax_ttm, 0.10), 0.45)
     else:
         d["tax_rate"] = 0.21
 
-    # ── EBITDA (derived: EBIT + D&A) ─────────────────────────────────────────
-    da_entries, _ = get_concept(usgaap,
-        "DepreciationDepletionAndAmortization",
-        "DepreciationAndAmortization",
-        "Depreciation",
-    )
-    d["da"] = abs(val(pick_annual(da_entries, latest_fy)) or 0)
-    d["ebitda"] = (d["ebit"] or 0) + d["da"] if d["ebit"] else None
+    capex_entries  = gc("PaymentsToAcquirePropertyPlantAndEquipment",
+                        "PaymentsForCapitalImprovements")
+    d["capex"]     = abs(ttm_flow(capex_entries) or 0)
 
-    # ── Gross Profit ─────────────────────────────────────────────────────────
-    gp_entries, _ = get_concept(usgaap, "GrossProfit")
-    d["gross_profit"] = val(pick_annual(gp_entries, latest_fy))
+    ocf_entries    = gc("NetCashProvidedByUsedInOperatingActivities")
+    d["operating_cf"] = ttm_flow(ocf_entries)
 
-    # ── EPS ──────────────────────────────────────────────────────────────────
-    eps_entries, _ = get_concept(usgaap,
-        "EarningsPerShareDiluted",
-        "EarningsPerShareBasic",
-    )
-    # EPS is in USD/shares, not USD — XBRL units key differs
-    eps_usd = usgaap.get("EarningsPerShareDiluted", {}).get("units", {}).get("USD/shares", []) or \
-              usgaap.get("EarningsPerShareBasic",   {}).get("units", {}).get("USD/shares", [])
-    eps_ann = [e for e in eps_usd if e.get("form") in ("10-K","10-K/A") and e.get("fp")=="FY"]
-    eps_ann.sort(key=lambda x: x.get("end",""), reverse=True)
-    d["eps"] = val(eps_ann[0]) if eps_ann else safe_div(d["net_income"], None)
+    div_entries    = gc("PaymentsOfDividends", "PaymentsOfDividendsCommonStock",
+                        "PaymentsOfOrdinaryDividends")
+    d["dividends_paid"] = abs(ttm_flow(div_entries) or 0)
 
-    # ── Shares outstanding ───────────────────────────────────────────────────
-    sh_entries = usgaap.get("CommonStockSharesOutstanding", {}).get("units", {}).get("shares", []) or \
-                 dei.get("EntityCommonStockSharesOutstanding", {}).get("units", {}).get("shares", [])
-    sh_ann = [e for e in sh_entries if e.get("form") in ("10-K","10-K/A","DEF 14A")]
-    sh_ann.sort(key=lambda x: x.get("end",""), reverse=True)
-    d["shares"] = val(sh_ann[0]) if sh_ann else None
+    # ── TTM EPS (sum of 4 quarters) ───────────────────────────────────────────
+    # ttm_eps() mirrors Yahoo Finance's "Trailing EPS" calculation exactly.
+    d["eps"] = ttm_eps(usgaap)
 
-    # ── Balance sheet — Cash ─────────────────────────────────────────────────
-    cash_entries, _ = get_concept(usgaap,
-        "CashAndCashEquivalentsAtCarryingValue",
-        "CashCashEquivalentsAndShortTermInvestments",
-        "Cash",
-    )
-    d["cash"] = val(pick_annual(cash_entries, latest_fy))
+    # ── Latest snapshot — balance sheet ──────────────────────────────────────
+    # Balance sheet items are point-in-time: use most recent 10-Q or 10-K.
+    cash_entries = gc("CashAndCashEquivalentsAtCarryingValue",
+                      "CashCashEquivalentsAndShortTermInvestments", "Cash")
+    d["cash"] = latest_snapshot(cash_entries)
 
-    # ── Balance sheet — Total Debt ───────────────────────────────────────────
-    # Try combined debt first, fall back to long + short
-    ltd_entries, _ = get_concept(usgaap,
-        "LongTermDebtAndCapitalLeaseObligation",
-        "LongTermDebt",
-    )
-    std_entries, _ = get_concept(usgaap,
-        "ShortTermBorrowings",
-        "DebtCurrent",
-        "CommercialPaper",
-    )
-    ltd = val(pick_annual(ltd_entries, latest_fy)) or 0
-    std = val(pick_annual(std_entries, latest_fy)) or 0
+    ltd_entries = gc("LongTermDebtAndCapitalLeaseObligation", "LongTermDebt")
+    std_entries = gc("ShortTermBorrowings", "DebtCurrent", "CommercialPaper")
+    ltd = latest_snapshot(ltd_entries) or 0
+    std = latest_snapshot(std_entries) or 0
     d["total_debt"] = ltd + std if (ltd or std) else None
 
-    # ── Balance sheet — Equity ───────────────────────────────────────────────
-    eq_entries, _ = get_concept(usgaap,
-        "StockholdersEquity",
-        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
-        "PartnersCapital",
-    )
-    d["total_equity"] = val(pick_annual(eq_entries, latest_fy))
-    d["book_value_ps"] = safe_div(d["total_equity"], d["shares"])
+    eq_entries = gc("StockholdersEquity",
+                    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+                    "PartnersCapital")
+    d["total_equity"]  = latest_snapshot(eq_entries)
+    d["book_value_ps"] = safe_div(d["total_equity"], None)  # set after shares
 
-    # ── Cash Flow — Capex ────────────────────────────────────────────────────
-    capex_entries, _ = get_concept(usgaap,
-        "PaymentsToAcquirePropertyPlantAndEquipment",
-        "PaymentsForCapitalImprovements",
+    # ── Shares outstanding (latest filing) ───────────────────────────────────
+    sh_entries = (
+        usgaap.get("CommonStockSharesOutstanding", {}).get("units", {}).get("shares", []) or
+        dei.get("EntityCommonStockSharesOutstanding", {}).get("units", {}).get("shares", [])
     )
-    d["capex"] = abs(val(pick_annual(capex_entries, latest_fy)) or 0)
+    sh_entries.sort(key=lambda x: (x.get("end",""), x.get("filed","")), reverse=True)
+    d["shares"] = safe_float(sh_entries[0].get("val")) if sh_entries else None
+    if d["total_equity"] and d["shares"]:
+        d["book_value_ps"] = safe_div(d["total_equity"], d["shares"])
 
-    # ── Cash Flow — Operating ────────────────────────────────────────────────
-    ocf_entries, _ = get_concept(usgaap,
-        "NetCashProvidedByUsedInOperatingActivities",
-    )
-    d["operating_cf"] = val(pick_annual(ocf_entries, latest_fy))
+    # ── Dividend per share ────────────────────────────────────────────────────
+    d["dividend_ttm"] = safe_div(d["dividends_paid"], d["shares"])                         if d["shares"] and d["dividends_paid"] else 0
 
-    # ── Cash Flow — Dividends ────────────────────────────────────────────────
-    div_entries, _ = get_concept(usgaap,
-        "PaymentsOfDividends",
-        "PaymentsOfDividendsCommonStock",
-        "PaymentsOfOrdinaryDividends",
-    )
-    d["dividends_paid"] = abs(val(pick_annual(div_entries, latest_fy)) or 0)
-    d["dividend_ttm"] = safe_div(d["dividends_paid"], d["shares"]) \
-                        if d["shares"] and d["dividends_paid"] else 0
+    # ── Fiscal year label (from latest annual revenue for display) ────────────
+    rev_ann = [e for e in rev_entries
+               if e.get("form") in ("10-K","10-K/A") and e.get("fp") == "FY"]
+    rev_ann.sort(key=lambda x: x.get("end",""), reverse=True)
+    d["fiscal_year"] = rev_ann[0].get("fy") if rev_ann else None
 
-    # ── Market data — price and market cap not in EDGAR XBRL ─────────────────
-    # EDGAR only has fundamental filing data, not real-time prices.
-    # We derive what we can from the filings; price must come from elsewhere.
-    # For now we set these to None and tell the user to enter price manually.
+    # ── Market data (price set later from yfinance) ───────────────────────────
     d["price"]      = None
     d["market_cap"] = None
     d["beta"]       = None
+    d["sector"]     = "N/A"
+    d["industry"]   = "N/A"
 
-    # ── Sector / industry — from EDGAR entity metadata ────────────────────────
-    # EDGAR doesn't tag sector in companyfacts; use SIC description if available
-    d["sector"]   = facts.get("facts", {}).get("dei", {}).get("SicDescription", {})
-    d["industry"] = "N/A"
-
-    # ── Growth ───────────────────────────────────────────────────────────────
+    # ── Growth (YOY using prior annual as base) ───────────────────────────────
     if d["revenue"] and d["revenue_prior"] and d["revenue_prior"] != 0:
         d["revenue_growth"] = (d["revenue"] - d["revenue_prior"]) / abs(d["revenue_prior"])
     else:
@@ -422,21 +505,19 @@ def extract_financials(facts: dict, ticker: str) -> dict:
     # Invested Capital = Equity + Debt − Surplus Cash
     # ROIC = NOPAT / Invested Capital
     try:
-        op_cash_needed  = (d["revenue"] or 0) * 0.01
-        surplus_cash    = max((d["cash"] or 0) - op_cash_needed, 0)
-        nopat           = (d["ebit"] or 0) * (1 - d["tax_rate"])
-        inv_cap         = (d["total_equity"] or 0) + (d["total_debt"] or 0) - surplus_cash
-        d["roic"]           = safe_div(nopat, inv_cap) if inv_cap and inv_cap > 0 else None
-        d["surplus_cash"]   = surplus_cash
-        d["nopat"]          = nopat
+        op_cash_needed    = (d["revenue"] or 0) * 0.01
+        surplus_cash      = max((d["cash"] or 0) - op_cash_needed, 0)
+        nopat             = (d["ebit"] or 0) * (1 - d["tax_rate"])
+        inv_cap           = (d["total_equity"] or 0) + (d["total_debt"] or 0) - surplus_cash
+        d["roic"]         = safe_div(nopat, inv_cap) if inv_cap and inv_cap > 0 else None
+        d["surplus_cash"] = surplus_cash
+        d["nopat"]        = nopat
         d["invested_capital"] = inv_cap
-    except:
+    except Exception:
         d["roic"] = None
         d["surplus_cash"] = d["nopat"] = d["invested_capital"] = 0
 
-    # ── EV (without price we can only do debt + equity book) ─────────────────
-    d["ev_dollars"] = None   # requires market cap (price × shares)
-
+    d["ev_dollars"]    = None   # requires market price
     d["price_history"] = None
     return d
 
@@ -651,6 +732,9 @@ with st.spinner(f"Fetching 10-K data for {ticker} (CIK {cik})…"):
         st.stop()
 
 d = extract_financials(facts, ticker)
+
+# EPS and all income items are now TTM from EDGAR quarterly filings.
+# yfinance is only used for the live price (already fetched for sidebar).
 v = compute_valuations(d, r, g, lifo_reserve, manual_price)
 
 # ── Header ─────────────────────────────────────────────────────────────────────
@@ -695,10 +779,12 @@ with tab1:
 
     st.markdown('<div class="section-header">Market Multiples (requires price)</div>', unsafe_allow_html=True)
     mc1, mc2, mc3, mc4 = st.columns(4)
-    mc1.metric("P/E Ratio",  fmt_x(v["pe_ratio"])  if v["pe_ratio"]  else "Enter price →")
+    mc1.metric("P/E Ratio (TTM)", fmt_x(v["pe_ratio"]) if v["pe_ratio"] else "Enter price →",
+               help="Price ÷ TTM EPS. EPS = sum of last 4 quarters from EDGAR 10-Q/10-K filings.")
     mc2.metric("P/B Ratio",  fmt_x(v["pb_ratio"])  if v["pb_ratio"]  else "Enter price →")
     mc3.metric("P/S Ratio",  fmt_x(v["ps_ratio"])  if v["ps_ratio"]  else "Enter price →")
-    mc4.metric("EPS (Dil.)", f"${d['eps']:,.2f}"   if d.get("eps")   else "N/A")
+    mc4.metric("EPS (TTM)", f"${d['eps']:,.2f}" if d.get("eps") else "N/A",
+              help="Sum of last 4 quarters of diluted EPS from EDGAR 10-Q/10-K filings.")
 
     st.markdown('<div class="section-header">Profitability</div>', unsafe_allow_html=True)
     st.markdown(book_note(
